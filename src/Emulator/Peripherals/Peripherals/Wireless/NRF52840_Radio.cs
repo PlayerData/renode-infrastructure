@@ -25,7 +25,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             IRQ = new GPIO();
             interruptManager = new InterruptManager<Events>(this, IRQ, "RadioIrq");
             shorts = new Shorts();
-            events = new IFlagRegisterField[(int)Events.PHYEnd + 1];
+            events = new IFlagRegisterField[32];
             rxBuffer = new ConcurrentQueue<KeyValuePair<byte[], IRadio>>();
             DefineRegisters();
             Reset();
@@ -154,6 +154,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             DefineEvent(Registers.RxReady, RxEnable, Events.RxReady, "EVENTS_RXREADY");
 
+            DefineEvent(Registers.PHYEnd, () => {}, Events.PHYEnd, "EVENTS_PHYEND");
+
+            DefineEvent(Registers.DeviceMatch, () => {}, Events.DeviceAddressMatch, "EVENTS_DEVMATCH");
+            DefineEvent(Registers.DeviceMiss, () => {}, Events.DeviceAddressMiss, "EVENTS_DEVMISS");
+
             // Notice: while the whole Shorts register is implemented, we don't necessarily
             // support all the mentioned events and tasks
             Registers.Shorts.Define(this)
@@ -188,6 +193,16 @@ namespace Antmicro.Renode.Peripherals.Wireless
             Registers.CRCStatus.Define(this)
                .WithFlag(0, name: "CRCSTATUS", valueProviderCallback: _ => true) // we assume here that CRCs are always ok
                .WithReservedBits(1, 31)
+            ;
+
+            Registers.RxMatch.Define(this, name: "RXMATCH")
+                .WithValueField(0, 3, FieldMode.Read, name: "RXMATCH")
+                .WithReservedBits(3, 29)
+            ;
+
+            Registers.RxCRC.Define(this, name: "RXCRC")
+                .WithValueField(0, 24, FieldMode.Read, name: "RXCRC")
+                .WithReservedBits(24, 8)
             ;
 
             Registers.PacketPointer.Define(this)
@@ -232,8 +247,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 .WithValueField(8, 8, out staticLength, name: "STATLEN")
                 .WithValueField(16, 3, out baseAddressLength, name: "BALEN")
                 .WithReservedBits(19, 5)
-                .WithTaggedFlag("ENDIAN", 24)
-                .WithTaggedFlag("WHITEEN", 25)
+                .WithFlag(24, name: "ENDIAN")
+                .WithFlag(25, name: "WHITEEN")
                 .WithReservedBits(26, 6)
             ;
 
@@ -288,14 +303,33 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 .WithReservedBits(4, 28)
             ;
 
+            Registers.DataWhiteningInitialValue.Define(this, name: "DATAWHITEIV")
+                .WithValueField(0, 7, name: "DATAWHITEIV")
+                .WithReservedBits(7, 25)
+            ;
+
             Registers.BitCounterCompare.Define(this, name: "BCC")
                 .WithValueField(0, 32, out bitCountCompare)
             ;
 
+            Registers.PDUStatus.Define(this, name: "PDUSTAT")
+                .WithValueField(0, 32, FieldMode.Read, name: "PDUSTAT")
+            ;
+
+            Registers.DeviceAddressMatchIndex.Define(this, name: "DAI")
+                .WithValueField(0, 3, FieldMode.Read, name: "DAI")
+                .WithReservedBits(3, 29)
+            ;
+
+            Registers.DeviceAddressMatchConfiguration.Define(this, name: "DACNF")
+                .WithValueField(0, 16, name: "ENA")
+                .WithValueField(16, 16, name: "TXADD")
+            ;
+
             Registers.ModeConfiguration0.Define(this, 0x200)
-                .WithTaggedFlag("RU", 0)
+                .WithFlag(0, name: "RU")
                 .WithReservedBits(1, 7)
-                .WithTag("DTX", 8, 2)
+                .WithValueField(8, 2, name: "DTX")
                 .WithReservedBits(10, 22)
             ;
 
@@ -305,6 +339,42 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 .WithTag("CCAEDTHRES", 8, 8)
                 .WithTag("CCACORRTHRES", 16, 8)
                 .WithTag("CCACORRCNT", 24, 8)
+            ;
+
+            Registers.DFESwitch.Define(this, name: "DFESWITCH")
+                .WithValueField(0, 32, name: "DFESWITCH")
+            ;
+
+            Registers.DFEGPIOSelect0.Define(this, name: "DFEGPIO0")
+                .WithValueField(0, 32, name: "DFEGPIO0")
+            ;
+
+            Registers.DFEGPIOSelect1.Define(this, name: "DFEGPIO1")
+                .WithValueField(0, 32, name: "DFEGPIO1")
+            ;
+
+            Registers.CTEInlineConfig.Define(this, name: "CTEINLINECONF")
+                .WithValueField(0, 32, name: "CTEINLINECONF")
+            ;
+
+            Registers.DFEControl1.Define(this, name: "DFECTRL1")
+                .WithValueField(0, 32, name: "DFECTRL1")
+            ;
+
+            Registers.DFEControl2.Define(this, name: "DFECTRL2")
+                .WithValueField(0, 32, name: "DFECTRL2")
+            ;
+
+            Registers.SwitchPattern.Define(this, name: "SWITCHPATTERN")
+                .WithValueField(0, 32, name: "SWITCHPATTERN")
+            ;
+
+            Registers.ClearPattern.Define(this, name: "CLEARPATTERN")
+                .WithValueField(0, 32, name: "CLEARPATTERN")
+            ;
+
+            Registers.DFEMode.Define(this, name: "DFEMODE")
+                .WithValueField(0, 32, name: "DFEMODE")
             ;
 
             Registers.PowerControl.Define(this, 1, name: "POWER")
@@ -333,9 +403,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
-            LogUnhandledShort(shorts.DisabledRSSIStop, nameof(shorts.DisabledRSSIStop));
-            LogUnhandledShort(shorts.DisabledRxEnable, nameof(shorts.DisabledRxEnable));
-            LogUnhandledShort(shorts.DisabledTxEnable, nameof(shorts.DisabledTxEnable));
+            if(shorts.DisabledRxEnable.Value)
+            {
+                RxEnable();
+            }
+            else if(shorts.DisabledTxEnable.Value)
+            {
+                TxEnable();
+            }
         }
 
         // These comments sum up some details gathered from the documentation.
@@ -515,13 +590,17 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 SetEvent(Events.Payload);
                 SetEvent(Events.End);
+                SetEvent(Events.PHYEnd);
                 SetEvent(Events.CRCOk);
             }, endTimeStamp);
 
-            // BLE stacks use disabled event as common processing trigger.
             timeSource.ExecuteInSyncedState(_ =>
             {
-                if(shorts.EndDisable.Value)
+                if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
+                {
+                    Start();
+                }
+                else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
                 {
                     Disable();
                 }
@@ -680,7 +759,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
             DeviceAddressMatch = 5,
             DeviceAddressMiss = 6,
             RSSIEnd = 7,
+            Reserved8 = 8,
+            Reserved9 = 9,
             BitCountMatch = 10,
+            Reserved11 = 11,
             CRCOk = 12,
             CRCError = 13,
             FrameStart = 14,
@@ -693,8 +775,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
             TxReady = 21,
             RxReady = 22,
             MACHeaderMatch = 23,
+            Reserved24 = 24,
+            Reserved25 = 25,
             Sync = 26,
-            PHYEnd = 27
+            PHYEnd = 27,
+            Reserved28 = 28,
+            Reserved29 = 29,
+            Reserved30 = 30,
+            Reserved31 = 31
         }
 
         private enum CCAMode
@@ -752,6 +840,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             RxCRC = 0x40C,
             DeviceAddressMatchIndex = 0x410,
             PayloadStatus = 0x414,
+            PDUStatus = 0x450,
             PacketPointer = 0x504,
             Frequency = 0x508,
             TxPower = 0x50C,
@@ -772,6 +861,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
             State = 0x550,
             DataWhiteningInitialValue = 0x554,
             BitCounterCompare = 0x560,
+            DFEGPIOSelect0 = 0x568,
+            DFEGPIOSelect1 = 0x58C,
             DeviceAddressBaseSegment0 = 0x600,
             DeviceAddressBaseSegment1 = 0x604,
             DeviceAddressBaseSegment2 = 0x608,
@@ -796,6 +887,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
             EnergyDetectLoopCount = 0x664,
             EnergyDetectLevel = 0x668,
             CCAControl = 0x66C,
+            CTEInlineConfig = 0x73C,
+            DFEControl1 = 0x740,
+            DFEControl2 = 0x74C,
+            DFESwitch = 0x774,
+            SwitchPattern = 0x778,
+            ClearPattern = 0x77C,
+            DFEMode = 0x900,
             PowerControl = 0xFFC
         }
     }
