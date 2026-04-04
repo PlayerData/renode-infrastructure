@@ -58,7 +58,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var headerLengthInRAM = HeaderLengthInRAM();
 
             var dataAddress = (uint)packetPointer.Value;
-            sysbus.WriteBytes(frame, address: dataAddress, startingIndex: addressLength, count: headerLengthInRAM);
+
+            // Write the on-air header bytes to RAM. When headerLengthInRAM > headerLengthInAir
+            // (S1INCL=1 with S1LEN=0), the extra S1 padding byte in RAM must not consume
+            // a payload byte from the frame.
+            sysbus.WriteBytes(frame, address: dataAddress, startingIndex: addressLength, count: headerLengthInAir);
+            if(headerLengthInRAM > headerLengthInAir)
+            {
+                // Zero-fill the S1 padding byte(s) between header and payload in RAM
+                for(int i = 0; i < headerLengthInRAM - headerLengthInAir; i++)
+                {
+                    sysbus.WriteByte(dataAddress + (uint)headerLengthInAir + (uint)i, 0);
+                }
+            }
+
             var payloadLength = Math.Min(frame[addressLength + (int)s0Length.Value], (byte)maxPacketLength.Value);
             sysbus.WriteBytes(frame, address: (ulong)(dataAddress + headerLengthInRAM), startingIndex: addressLength + headerLengthInAir, count: payloadLength);
 
