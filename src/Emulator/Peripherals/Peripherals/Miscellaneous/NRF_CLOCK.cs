@@ -212,6 +212,43 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Registers.PowerUSBMainRegisterStatus.Define(this)
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => true, name: "MAINREGSTATUS")
                 .WithReservedBits(1, 31);
+
+            Registers.CalibrationTimerTimeout.Define(this)
+                .WithFlag(0, name: "EVENTS_CTTO")
+                .WithReservedBits(1, 31);
+
+            Registers.CallibrationTimerInterval.Define(this)
+                .WithValueField(0, 7, FieldMode.Read, name: "CTIV")
+                .WithReservedBits(7, 25);
+
+            Registers.HFCLKStartTriggered.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hfclkStarted, name: "STATUS")
+                .WithReservedBits(1, 31);
+
+            Registers.LFCLKStartTriggered.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => lfclkStarted, name: "STATUS")
+                .WithReservedBits(1, 31);
+
+            Registers.ResetReason.Define(this)
+                .WithValueField(0, 32, name: "RESETREAS");
+
+            Registers.HFCLK192MStat.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hfclk192mStarted, name: "SRC")
+                .WithReservedBits(1, 15)
+                .WithFlag(16, FieldMode.Read, valueProviderCallback: _ => hfclk192mStarted, name: "STATE")
+                .WithReservedBits(17, 15);
+
+            Registers.HFCLK192MRun.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hfclk192mStarted, name: "STATUS")
+                .WithReservedBits(1, 31);
+
+            Registers.HFCLK192MFreqConfig.Define(this)
+                .WithValueField(0, 32, name: "FREQUENCY");
+
+            Registers.RAMPower0.DefineMany(this, 16, (register, idx) =>
+            {
+                register.WithValueField(0, 32, name: $"RAM[{idx}].POWER");
+            });
         }
 
         private bool lfclkStarted;
@@ -247,18 +284,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             CalibrationTimerStopped = 0x12C,
             EnableInterrupt = 0x304,
             DisableInterrupt = 0x308,
+            ResetReason = 0x400,
             HFCLKStartTriggered = 0x408,
             HFCLKStatus = 0x40C,
             LFCLKStartTriggered = 0x414,
             LFCLKStatus = 0x418,
             LFCLKClockSourceCopy = 0x41C,
             PowerUsbRegisterStatus = 0x438,
+            HFCLK192MStat = 0x508,
+            HFCLK192MRun = 0x510,
             LFCLKClockSource = 0x518,
             HFXODebounceTime = 0x528,
             CallibrationTimerInterval = 0x538,
+            HFCLK192MFreqConfig = 0x558,
             TraceConfig = 0x55C,
             LFRCModeConfiguration = 0x5B4,
-            PowerUSBMainRegisterStatus = 0x640
+            PowerUSBMainRegisterStatus = 0x640,
+            RAMPower0 = 0xE00
         }
     }
 }
