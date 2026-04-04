@@ -146,6 +146,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     .WithWriteCallback((_, __) =>
                     {
                         pinToChannelMapping.Clear();
+                        var ch = channels[idx];
+                        if(ch.Mode == Mode.Event && ch.SelectedPort < ports.Length && ports[ch.SelectedPort] != null)
+                        {
+                            var pin = (int)ch.SelectedPin;
+                            if(pin < ports[ch.SelectedPort].Pins.Length)
+                            {
+                                ch.CurrentState = ports[ch.SelectedPort].Pins[pin].InputValue;
+                            }
+                        }
                         UpdateInterrupt();
                     });
             });
