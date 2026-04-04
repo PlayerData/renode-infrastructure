@@ -41,10 +41,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                     this.Log(LogLevel.Noisy, "IRQ #{0} triggered", j);
                     compareReached[j].Value = true;
-                    if(compareEventEnabled[j].Value)
-                    {
-                        EventTriggered?.Invoke((uint)Register.Compare0EventPending + j * 4);
-                    }
+                    EventTriggered?.Invoke((uint)Register.Compare0EventPending + j * 4);
                     UpdateInterrupts();
                 };
             }
@@ -191,17 +188,27 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithReservedBits(12, 20)
                 },
                 {(long)Register.EventEnable, new DoubleWordRegister(this)
+                   .WithFlag(0, out tickEventEnabled, name: "TICK")
+                   .WithFlag(1, out ovrflwEventEnabled, name: "OVRFLW")
+                   .WithReservedBits(2, 14)
                    .WithFlags(16, numberOfEvents, out compareEventEnabled, name: "COMPARE")
                 },
                 {(long)Register.EventSet, new DoubleWordRegister(this)
-                   .WithTaggedFlag("TICK", 0)
-                   .WithTaggedFlag("OVRFLW", 1)
+                   .WithFlag(0, writeCallback: (_, val) => { if(val) tickEventEnabled.Value = true; },
+                         valueProviderCallback: _ => tickEventEnabled.Value, name: "TICK")
+                   .WithFlag(1, writeCallback: (_, val) => { if(val) ovrflwEventEnabled.Value = true; },
+                         valueProviderCallback: _ => ovrflwEventEnabled.Value, name: "OVRFLW")
                    .WithReservedBits(2, 14)
                    .WithFlags(16, numberOfEvents,
                          writeCallback: (i, _, val) => compareEventEnabled[i].Value |= val,
                          valueProviderCallback: (i, _) => compareEventEnabled[i].Value)
                 },
                 {(long)Register.EventClear, new DoubleWordRegister(this)
+                   .WithFlag(0, writeCallback: (_, val) => { if(val) tickEventEnabled.Value = false; },
+                         valueProviderCallback: _ => tickEventEnabled.Value, name: "TICK")
+                   .WithFlag(1, writeCallback: (_, val) => { if(val) ovrflwEventEnabled.Value = false; },
+                         valueProviderCallback: _ => ovrflwEventEnabled.Value, name: "OVRFLW")
+                   .WithReservedBits(2, 14)
                    .WithFlags(16, numberOfEvents,
                          writeCallback: (i, _, val) => compareEventEnabled[i].Value &= !val,
                          valueProviderCallback: (i, _) => compareEventEnabled[i].Value)
@@ -210,6 +217,10 @@ namespace Antmicro.Renode.Peripherals.Timers
                    .WithFlag(0, out tickEvent, name: "EVENTS_TICK")
                    .WithReservedBits(1, 31)
                    .WithWriteCallback((_, __) => UpdateInterrupts())
+                },
+                {(long)Register.Overflow, new DoubleWordRegister(this)
+                   .WithFlag(0, name: "EVENTS_OVRFLW")
+                   .WithReservedBits(1, 31)
                 }
             };
 
@@ -265,6 +276,8 @@ namespace Antmicro.Renode.Peripherals.Timers
         private IValueRegisterField prescaler;
         private IFlagRegisterField tickInterruptEnabled;
         private IFlagRegisterField tickEvent;
+        private IFlagRegisterField tickEventEnabled;
+        private IFlagRegisterField ovrflwEventEnabled;
 
         private DoubleWordRegisterCollection registers;
         private IFlagRegisterField[] compareEventEnabled;
