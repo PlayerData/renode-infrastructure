@@ -13,6 +13,7 @@ using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Miscellaneous;
+using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
@@ -559,9 +560,16 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var disableTime = endTime + TimeInterval.FromMicroseconds(10);
             var disableTimeStamp = new TimeStamp(disableTime, timeSource.Domain);
 
-            // Address modelled as happening immediatley and serves as anchor
-            // point for other events. RIOT triggers IRQ from it.
+            // Bypass PPI for Timer0 — PPI's ExecuteInNearestSyncedState
+            // introduces multi-quantum delays that break BLE stack timing.
+            // On real hardware PPI triggers within one PCLK16M cycle (~62.5ns).
+            Timer0?.WriteDoubleWord(0x000, 0x1);  // TASKS_START (idempotent)
+
+            // Address modelled as happening immediately and serves as anchor
+            // point for other events.
             SetEvent(Events.Address);
+
+            Timer0?.WriteDoubleWord(0x044, 0x1);  // TASKS_CAPTURE[1]
 
             // RSSI sample period is 0.25 us. Acceptable to model as happening
             // immediatley upon start
@@ -592,6 +600,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 SetEvent(Events.End);
                 SetEvent(Events.PHYEnd);
                 SetEvent(Events.CRCOk);
+                Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
             }, endTimeStamp);
 
             timeSource.ExecuteInSyncedState(_ =>
@@ -654,6 +663,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private IFlagRegisterField frequencyMap;
         private IValueRegisterField frequency;
         private IValueRegisterField packetPointer;
+
+        private NRF52840_Timer timer0;
+
+        private NRF52840_Timer Timer0
+        {
+            get
+            {
+                if(timer0 == null)
+                {
+                    machine.TryGetByName("sysbus.timer0", out timer0);
+                }
+                return timer0;
+            }
+        }
 
         private readonly IFlagRegisterField[] events;
         private readonly InterruptManager<Events> interruptManager;
