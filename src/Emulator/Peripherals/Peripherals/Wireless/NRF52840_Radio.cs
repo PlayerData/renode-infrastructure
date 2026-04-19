@@ -27,7 +27,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             interruptManager = new InterruptManager<Events>(this, IRQ, "RadioIrq");
             shorts = new Shorts();
             events = new IFlagRegisterField[32];
-            rxBuffer = new ConcurrentQueue<KeyValuePair<byte[], IRadio>>();
+            rxBuffer = new ConcurrentQueue<(byte[] Frame, IRadio Sender, int SenderChannel)>();
             DefineRegisters();
             Reset();
         }
@@ -35,6 +35,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         public override void Reset()
         {
             radioState = State.Disabled;
+            packetInProgress = false;
+            disablePending = false;
             interruptManager.Reset();
             base.Reset();
             addressPrefixes = new byte[8];
@@ -50,10 +52,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             if(radioState != State.RxIdle)
             {
-                rxBuffer.Enqueue(new KeyValuePair<byte[], IRadio>(frame, sender));
+                rxBuffer.Enqueue((frame, sender, 0));
+                var ts = machine.LocalTimeSource;
+                var retryStamp = new TimeStamp(
+                    ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(5),
+                    ts.Domain);
+                ts.ExecuteInSyncedState(_ =>
+                {
+                    if(radioState == State.RxIdle && !rxBuffer.IsEmpty)
+                    {
+                        Start();
+                    }
+                }, retryStamp);
                 return;
             }
-
             var addressLength = (int)baseAddressLength.Value + 1;
             var headerLengthInAir = HeaderLengthInAir();
             var headerLengthInRAM = HeaderLengthInRAM();
@@ -76,8 +88,50 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var payloadLength = Math.Min(frame[addressLength + (int)s0Length.Value], (byte)maxPacketLength.Value);
             sysbus.WriteBytes(frame, address: (ulong)(dataAddress + headerLengthInRAM), startingIndex: addressLength + headerLengthInAir, count: payloadLength);
 
-            var crcLen = 4;
-            ScheduleRadioEvents((uint)(headerLengthInAir + payloadLength + crcLen));
+            var timeSource = machine.LocalTimeSource;
+            var shortsTimeStamp = new TimeStamp(
+                timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
+                timeSource.Domain);
+
+            Timer0?.WriteDoubleWord(0x000, 0x1);  // TASKS_START
+            SetEvent(Events.Address);
+            Timer0?.WriteDoubleWord(0x044, 0x1);  // TASKS_CAPTURE[1]
+
+            if(shorts.AddressRSSIStart.Value)
+            {
+                SetEvent(Events.RSSIEnd);
+            }
+            if(shorts.AddressBitCountStart.Value)
+            {
+                SetEvent(Events.BitCountMatch);
+            }
+
+            packetInProgress = true;
+            disablePending = false;
+
+            SetEvent(Events.Payload);
+            SetEvent(Events.End);
+            SetEvent(Events.PHYEnd);
+            SetEvent(Events.CRCOk);
+            Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
+
+            timeSource.ExecuteInSyncedState(_ =>
+            {
+                packetInProgress = false;
+                if(disablePending)
+                {
+                    disablePending = false;
+                    Disable();
+                }
+                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
+                {
+                    Start();
+                }
+                else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
+                {
+                    Disable();
+                }
+            }, shortsTimeStamp);
         }
 
         public int Channel
@@ -402,6 +456,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private void Disable()
         {
+            if(packetInProgress)
+            {
+                disablePending = true;
+                return;
+            }
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
             if(shorts.DisabledRxEnable.Value)
@@ -468,6 +527,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 Start();
             }
+            else if(!rxBuffer.IsEmpty)
+            {
+                Start();
+            }
             LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
         }
 
@@ -480,10 +543,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
             else if(radioState == State.RxIdle)
             {
-                // Can only receive one packet per enable
-                if(rxBuffer.TryDequeue(out var pair))
+                if(rxBuffer.TryDequeue(out var entry))
                 {
-                    ReceiveFrame(pair.Key, pair.Value);
+                    ReceiveFrame(entry.Frame, entry.Sender);
                 }
             }
             else
@@ -532,12 +594,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
 
-            FrameSent?.Invoke(this, data);
-
             var crcLen = 4;
+            pendingTxData = data;
             ScheduleRadioEvents((uint)(headerLengthInAir + payloadLength + crcLen));
-
-            LogUnhandledShort(shorts.EndStart, nameof(shorts.EndStart)); // not sure how to support it. It's instant from our perspective.
         }
 
         private void ScheduleRadioEvents(uint packetLen)
@@ -556,9 +615,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // End event
             var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * 8);
             var endTimeStamp = new TimeStamp(endTime, timeSource.Domain);
-
-            var disableTime = endTime + TimeInterval.FromMicroseconds(10);
-            var disableTimeStamp = new TimeStamp(disableTime, timeSource.Domain);
 
             // Bypass PPI for Timer0 — PPI's ExecuteInNearestSyncedState
             // introduces multi-quantum delays that break BLE stack timing.
@@ -591,21 +647,42 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }, bcMatchTimeStamp);
             }
 
-            // Schedule "end" events all at once, simulating the transmision time
-            // as 8 microseconds-per-byte. Timing distinction between events here doesn't
-            // seem important
+            packetInProgress = true;
+            disablePending = false;
+
+            // All end-of-packet processing in a single callback at the end of
+            // the on-air time.  Order matches real hardware:
+            //   1. End/PHYEnd events fire
+            //   2. Shorts execute with zero latency (hardware wiring)
+            //   3. FrameSent delivers the packet to the BLE medium AFTER the
+            //      sender's state machine has advanced (e.g. Disable → RxEnable)
+            //      so that the receiver sees the packet when the sender is
+            //      already in its post-TX state.
             timeSource.ExecuteInSyncedState(_ =>
             {
+                packetInProgress = false;
                 SetEvent(Events.Payload);
                 SetEvent(Events.End);
                 SetEvent(Events.PHYEnd);
                 SetEvent(Events.CRCOk);
                 Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
-            }, endTimeStamp);
 
-            timeSource.ExecuteInSyncedState(_ =>
-            {
-                if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
+                // FrameSent fires after End events but before shorts process,
+                // so the Radio is still on the TX channel when the BLE medium
+                // checks sender.Channel for delivery routing.
+                if(pendingTxData != null)
+                {
+                    var txData = pendingTxData;
+                    pendingTxData = null;
+                    FrameSent?.Invoke(this, txData);
+                }
+
+                if(disablePending)
+                {
+                    disablePending = false;
+                    Disable();
+                }
+                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
                 {
                     Start();
                 }
@@ -613,7 +690,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 {
                     Disable();
                 }
-            }, disableTimeStamp);
+            }, endTimeStamp);
         }
 
         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
@@ -635,6 +712,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
 
         private State radioState;
+        private bool packetInProgress;
+        private bool disablePending;
+        private byte[] pendingTxData;
         private byte[] addressPrefixes;
         private Shorts shorts;
         private IFlagRegisterField crcIncludedInLength;
@@ -681,7 +761,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private readonly IFlagRegisterField[] events;
         private readonly InterruptManager<Events> interruptManager;
 
-        private readonly ConcurrentQueue<KeyValuePair<byte[], IRadio>> rxBuffer;
+        private readonly ConcurrentQueue<(byte[] Frame, IRadio Sender, int SenderChannel)> rxBuffer;
 
         private readonly Dictionary<uint, int> bluetoothLEChannelMap = new Dictionary<uint, int>()
         {
@@ -728,6 +808,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         };
 
         private const int DefaultRSSISample = 10;
+        private const int MaxRxBufferSize = 16;
 
         private struct Shorts
         {

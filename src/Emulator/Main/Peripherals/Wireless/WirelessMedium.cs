@@ -104,6 +104,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var currentEmulation = EmulationManager.Instance.CurrentEmulation;
             currentEmulation.TryGetEmulationElementName(sender, out var senderName);
 
+            OnFrameSent(sender, sender.Channel);
             FrameProcessed?.Invoke(this, sender, packet);
 
             if(!mediumFunction.CanTransmit(senderPosition))
@@ -117,7 +118,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 var receiver = radioAndPosition.Key;
 
                 currentEmulation.TryGetEmulationElementName(receiver, out var receiverName);
-                if(!mediumFunction.CanReach(senderPosition, radioAndPosition.Value) || receiver.Channel != sender.Channel)
+                if(!mediumFunction.CanReach(senderPosition, radioAndPosition.Value) || !ChannelMatch(sender, receiver))
                 {
                     this.NoisyLog("Packet {0}:chan{1} -> {2}:chan{3} NOT delivered, size {4}.",
                           senderName, sender.Channel, receiverName, receiver.Channel, packet.Length);
@@ -134,7 +135,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
                 if(receiver is ISlipRadio)
                 {
-                    // send immediately
                     receiver.ReceiveFrame(packetCopy, sender);
                     continue;
                 }
@@ -146,6 +146,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     FrameTransmitted?.Invoke(this, sender, receiver, packetCopy);
                 });
             }
+        }
+
+        protected virtual bool ChannelMatch(IRadio sender, IRadio receiver)
+        {
+            return sender.Channel == receiver.Channel;
+        }
+
+        protected virtual void OnFrameSent(IRadio sender, int channel)
+        {
         }
 
         private IMediumFunction mediumFunction;
