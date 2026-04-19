@@ -631,14 +631,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
 
-            // Work around BLE LL feature-exchange collision in simulation.
-            // The SoftDevice Controller pre-loads LL_PERIPHERAL_FEATURE_REQ
-            // (0x0E) before the connection event, but in real hardware the
-            // ISR replaces it with LL_FEATURE_RSP (0x09) after receiving
-            // LL_FEATURE_REQ from the central.  In simulation the ISR
-            // doesn't run before the radio reads the TX buffer, so we
-            // patch the opcode here.  Both PDUs share the same payload
-            // format (8 bytes of LE feature bits).
+            // Suppress BLE LL feature-exchange procedures in simulation.
+            // Both SDC instances race to initiate feature exchange
+            // (LL_FEATURE_REQ from central, LL_PERIPHERAL_FEATURE_REQ
+            // from peripheral) but the ISR never processes the response
+            // before the next TX is committed, creating an infinite loop.
+            // Convert these control PDUs to Empty PDUs so the LL state
+            // machine skips feature exchange entirely.  Feature exchange
+            // is optional per BLE spec — the connection proceeds without it.
             if(Channel >= 0 && Channel <= 36 && payloadLength > 0)
             {
                 var s0 = data[addressLength];
@@ -646,9 +646,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 if(llid == 3) // LL Control PDU
                 {
                     var opcodeIndex = addressLength + headerLengthInAir;
-                    if(data[opcodeIndex] == 0x0E) // LL_PERIPHERAL_FEATURE_REQ
+                    var opcode = data[opcodeIndex];
+                    if(opcode == 0x08 || opcode == 0x0E) // LL_FEATURE_REQ or LL_PERIPHERAL_FEATURE_REQ
                     {
-                        data[opcodeIndex] = 0x09; // → LL_FEATURE_RSP
+                        // Convert to Empty PDU: LLID=1, length=0
+                        data[addressLength] = (byte)((s0 & 0xFC) | 0x01); // preserve SN/NESN/MD, set LLID=1
+                        data[addressLength + (uint)s0Length.Value] = 0;    // length = 0
+                        payloadLength = 0;
                     }
                 }
             }
