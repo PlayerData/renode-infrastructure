@@ -91,9 +91,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
 
             var timeSource = machine.LocalTimeSource;
-            var shortsTimeStamp = new TimeStamp(
-                timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
-                timeSource.Domain);
 
             Timer0?.WriteDoubleWord(0x000, 0x1);  // TASKS_START
             SetEvent(Events.Address);
@@ -117,6 +114,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
             SetEvent(Events.CRCOk);
             Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
 
+            // Delay shorts execution to give the CPU ISR time to process
+            // the received PDU and prepare the TX response.  In real
+            // hardware the BLE controller uses T_IFS (150 µs) between RX
+            // end and TX start; the CPU ISR runs during this window.
+            var shortsTimeStamp = new TimeStamp(
+                timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
+                timeSource.Domain);
+
             timeSource.ExecuteInSyncedState(_ =>
             {
                 packetInProgress = false;
@@ -125,13 +130,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     disablePending = false;
                     Disable();
                 }
-                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
-                {
-                    Start();
-                }
                 else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
                 {
                     Disable();
+                }
+                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
+                {
+                    Start();
                 }
             }, shortsTimeStamp);
         }
