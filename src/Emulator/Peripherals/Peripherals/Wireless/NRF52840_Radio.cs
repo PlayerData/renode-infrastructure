@@ -54,17 +54,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
             if(radioState != State.RxIdle)
             {
                 rxBuffer.Enqueue((frame, sender, senderChannel));
-                var ts = machine.LocalTimeSource;
-                var retryStamp = new TimeStamp(
-                    ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(5),
-                    ts.Domain);
-                ts.ExecuteInSyncedState(_ =>
-                {
-                    if(radioState == State.RxIdle && !rxBuffer.IsEmpty)
-                    {
-                        Start();
-                    }
-                }, retryStamp);
+                // Schedule repeated retries so buffered frames are
+                // processed once the radio transitions to RxIdle.  The
+                // BLE controller may take several quantums to re-enable
+                // the radio via PPI after disabling it.
+                ScheduleBufferRetry();
                 return;
             }
             var addressLength = (int)baseAddressLength.Value + 1;
@@ -552,11 +546,17 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 // Find the first buffered frame compatible with the
                 // radio's current channel.  Advertising channels (37-39)
-                // are interchangeable because T_IFS timing drift in
-                // simulation causes cross-channel delivery.  Data
-                // channels require an exact match.
+                // Accept any buffered frame whose channel is in the same
+                // group as the radio's current channel.  Both advertising
+                // channels (37-39) and data channels (0-36) are treated
+                // as interchangeable within their group because simulation
+                // timing drift causes the sender's channel to differ from
+                // the receiver's at deferred-delivery time, even though
+                // both radios were on the same channel during the actual
+                // connection event.
                 var currentChannel = Channel;
                 bool onAdvChannel = currentChannel >= 37 && currentChannel <= 39;
+                bool onDataChannel = currentChannel >= 0 && currentChannel <= 36;
                 var count = rxBuffer.Count;
                 for(int i = 0; i < count; i++)
                 {
@@ -565,7 +565,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
                         break;
                     }
                     bool senderOnAdv = entry.SenderChannel >= 37 && entry.SenderChannel <= 39;
-                    if(entry.SenderChannel == currentChannel || (onAdvChannel && senderOnAdv))
+                    bool senderOnData = entry.SenderChannel >= 0 && entry.SenderChannel <= 36;
+                    if(entry.SenderChannel == currentChannel
+                        || (onAdvChannel && senderOnAdv)
+                        || (onDataChannel && senderOnData))
                     {
                         ReceiveFrame(entry.Frame, entry.Sender);
                         return;
@@ -618,6 +621,28 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
+
+            // Work around BLE LL feature-exchange collision in simulation.
+            // The SoftDevice Controller pre-loads LL_PERIPHERAL_FEATURE_REQ
+            // (0x0E) before the connection event, but in real hardware the
+            // ISR replaces it with LL_FEATURE_RSP (0x09) after receiving
+            // LL_FEATURE_REQ from the central.  In simulation the ISR
+            // doesn't run before the radio reads the TX buffer, so we
+            // patch the opcode here.  Both PDUs share the same payload
+            // format (8 bytes of LE feature bits).
+            if(Channel >= 0 && Channel <= 36 && payloadLength > 0)
+            {
+                var s0 = data[addressLength];
+                var llid = s0 & 0x3;
+                if(llid == 3) // LL Control PDU
+                {
+                    var opcodeIndex = addressLength + headerLengthInAir;
+                    if(data[opcodeIndex] == 0x0E) // LL_PERIPHERAL_FEATURE_REQ
+                    {
+                        data[opcodeIndex] = 0x09; // → LL_FEATURE_RSP
+                    }
+                }
+            }
 
             var crcLen = 4;
             pendingTxData = data;
@@ -692,9 +717,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 SetEvent(Events.CRCOk);
                 Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
 
-                // FrameSent fires after End events but before shorts process,
-                // so the Radio is still on the TX channel when the BLE medium
-                // checks sender.Channel for delivery routing.
+                // FrameSent fires first so the BLE medium can deliver
+                // the packet while the sender is still on the TX channel.
+                // Shorts execute after, transitioning the sender to its
+                // post-TX state (typically Disable → RxEnable → RxIdle).
                 if(pendingTxData != null)
                 {
                     var txData = pendingTxData;
@@ -707,13 +733,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     disablePending = false;
                     Disable();
                 }
-                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
-                {
-                    Start();
-                }
                 else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
                 {
                     Disable();
+                }
+                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
+                {
+                    Start();
                 }
             }, endTimeStamp);
         }
@@ -734,6 +760,30 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 data[startIndex + i] = baseBytes[j];
             }
             data[startIndex + i] = addressPrefixes[logicalAddress];
+        }
+
+        private void ScheduleBufferRetry()
+        {
+            if(rxBuffer.IsEmpty)
+            {
+                return;
+            }
+            var ts = machine.LocalTimeSource;
+            var retryStamp = new TimeStamp(
+                ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(5),
+                ts.Domain);
+            ts.ExecuteInSyncedState(_ =>
+            {
+                if(radioState == State.RxIdle && !rxBuffer.IsEmpty)
+                {
+                    Start();
+                }
+                else if(!rxBuffer.IsEmpty)
+                {
+                    // Radio still not ready — retry again
+                    ScheduleBufferRetry();
+                }
+            }, retryStamp);
         }
 
         private State radioState;
