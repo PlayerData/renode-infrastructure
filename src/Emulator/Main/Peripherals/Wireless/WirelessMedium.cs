@@ -133,9 +133,12 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     hook(packetCopy);
                 }
 
-                if(receiver is ISlipRadio)
+                if(receiver is ISlipRadio || SynchronousDelivery)
                 {
                     receiver.ReceiveFrame(packetCopy, sender);
+                    this.NoisyLog("Packet {0}:chan{1} -> {2}:chan{3} delivered (sync), size {4}.",
+                          senderName, sender.Channel, receiverName, receiver.Channel, packet.Length);
+                    FrameTransmitted?.Invoke(this, sender, receiver, packetCopy);
                     continue;
                 }
 
@@ -156,6 +159,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         protected virtual void OnFrameSent(IRadio sender, int channel)
         {
         }
+
+        protected virtual bool SynchronousDelivery => false;
 
         private IMediumFunction mediumFunction;
         private readonly Dictionary<IRadio, Action<byte[]>> radioHooks;
