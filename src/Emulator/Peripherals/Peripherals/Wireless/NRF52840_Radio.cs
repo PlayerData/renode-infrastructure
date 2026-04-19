@@ -108,17 +108,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
             SetEvent(Events.CRCOk);
             Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
 
-            // Delay shorts execution to give the CPU ISR time to process
-            // the received PDU and prepare the TX response.  In real
-            // hardware the BLE controller uses T_IFS (150 µs) between RX
-            // end and TX start; the CPU ISR runs during this window.
+            // Delay shorts to give the CPU ISR time to process the
+            // received PDU and update the TX buffer.  The SDC's radio
+            // ISR needs several thousand instructions to handle packet
+            // processing, SN/NESN updates, and TX buffer preparation.
             var shortsTimeStamp = new TimeStamp(
                 timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
                 timeSource.Domain);
-
             timeSource.ExecuteInSyncedState(_ =>
-            {
-                packetInProgress = false;
+            {   packetInProgress = false;
                 if(disablePending)
                 {
                     disablePending = false;
@@ -630,32 +628,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
-
-            // Suppress BLE LL feature-exchange procedures in simulation.
-            // Both SDC instances race to initiate feature exchange
-            // (LL_FEATURE_REQ from central, LL_PERIPHERAL_FEATURE_REQ
-            // from peripheral) but the ISR never processes the response
-            // before the next TX is committed, creating an infinite loop.
-            // Convert these control PDUs to Empty PDUs so the LL state
-            // machine skips feature exchange entirely.  Feature exchange
-            // is optional per BLE spec — the connection proceeds without it.
-            if(Channel >= 0 && Channel <= 36 && payloadLength > 0)
-            {
-                var s0 = data[addressLength];
-                var llid = s0 & 0x3;
-                if(llid == 3) // LL Control PDU
-                {
-                    var opcodeIndex = addressLength + headerLengthInAir;
-                    var opcode = data[opcodeIndex];
-                    if(opcode == 0x08 || opcode == 0x0E) // LL_FEATURE_REQ or LL_PERIPHERAL_FEATURE_REQ
-                    {
-                        // Convert to Empty PDU: LLID=1, length=0
-                        data[addressLength] = (byte)((s0 & 0xFC) | 0x01); // preserve SN/NESN/MD, set LLID=1
-                        data[addressLength + (uint)s0Length.Value] = 0;    // length = 0
-                        payloadLength = 0;
-                    }
-                }
-            }
 
             var crcLen = 4;
             pendingTxData = data;
