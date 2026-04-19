@@ -50,9 +50,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         public void ReceiveFrame(byte[] frame, IRadio sender)
         {
+            var senderChannel = sender?.Channel ?? Channel;
             if(radioState != State.RxIdle)
             {
-                rxBuffer.Enqueue((frame, sender, 0));
+                rxBuffer.Enqueue((frame, sender, senderChannel));
                 var ts = machine.LocalTimeSource;
                 var retryStamp = new TimeStamp(
                     ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(5),
@@ -543,9 +544,27 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
             else if(radioState == State.RxIdle)
             {
-                if(rxBuffer.TryDequeue(out var entry))
+                // Find the first buffered frame compatible with the
+                // radio's current channel.  Advertising channels (37-39)
+                // are interchangeable because T_IFS timing drift in
+                // simulation causes cross-channel delivery.  Data
+                // channels require an exact match.
+                var currentChannel = Channel;
+                bool onAdvChannel = currentChannel >= 37 && currentChannel <= 39;
+                var count = rxBuffer.Count;
+                for(int i = 0; i < count; i++)
                 {
-                    ReceiveFrame(entry.Frame, entry.Sender);
+                    if(!rxBuffer.TryDequeue(out var entry))
+                    {
+                        break;
+                    }
+                    bool senderOnAdv = entry.SenderChannel >= 37 && entry.SenderChannel <= 39;
+                    if(entry.SenderChannel == currentChannel || (onAdvChannel && senderOnAdv))
+                    {
+                        ReceiveFrame(entry.Frame, entry.Sender);
+                        return;
+                    }
+                    rxBuffer.Enqueue(entry);
                 }
             }
             else
@@ -808,7 +827,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         };
 
         private const int DefaultRSSISample = 10;
-        private const int MaxRxBufferSize = 16;
+        private const int MaxRxBufferSize = 64;
 
         private struct Shorts
         {
