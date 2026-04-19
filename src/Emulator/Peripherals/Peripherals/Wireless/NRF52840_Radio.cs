@@ -472,6 +472,15 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 TxEnable();
             }
+            // If neither short handles the transition and there are
+            // buffered frames waiting, force-enable RX immediately to
+            // process them.  The BLE controller uses PPI to automate
+            // this transition, but Renode's PPI timing delays cause
+            // TASKS_RXEN to arrive too late.
+            if(radioState == State.Disabled && !rxBuffer.IsEmpty)
+            {
+                RxEnable();
+            }
         }
 
         // These comments sum up some details gathered from the documentation.
