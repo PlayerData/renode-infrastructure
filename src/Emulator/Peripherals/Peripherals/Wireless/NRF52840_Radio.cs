@@ -89,6 +89,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var payloadLength = Math.Min(frame[addressLength + (int)s0Length.Value], (byte)maxPacketLength.Value);
             sysbus.WriteBytes(frame, address: (ulong)(dataAddress + headerLengthInRAM), startingIndex: addressLength + headerLengthInAir, count: payloadLength);
 
+
             var timeSource = machine.LocalTimeSource;
             var shortsTimeStamp = new TimeStamp(
                 timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),

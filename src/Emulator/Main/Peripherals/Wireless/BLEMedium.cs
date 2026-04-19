@@ -31,28 +31,19 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // (which fails due to simulation timing drift), we allow delivery
         // when both sender and receiver are on advertising channels.
         // For data channels (0-36) we keep strict matching.
+        // In BLE simulation, the precise timing required for channel-
+        // synchronous delivery cannot be guaranteed because the virtual-
+        // time quantum scheduling causes inter-machine drift.  Rather
+        // than filtering by channel in the medium (which drops packets
+        // when the receiver has hopped to the next channel), we deliver
+        // all packets and let the radio's receive buffer handle channel
+        // matching.  NRF52840_Radio's Start() drains the buffer with a
+        // channel-type filter: advertising-channel frames are accepted
+        // when the radio is on any advertising channel, and data-channel
+        // frames require an exact channel match.
         protected override bool ChannelMatch(IRadio sender, IRadio receiver)
         {
-            var sCh = sender.Channel;
-            var rCh = receiver.Channel;
-
-            if(sCh == rCh)
-            {
-                return true;
-            }
-
-            // Both on advertising channels — allow cross-channel delivery
-            if(IsAdvertisingChannel(sCh) && IsAdvertisingChannel(rCh))
-            {
-                return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsAdvertisingChannel(int channel)
-        {
-            return channel == 37 || channel == 38 || channel == 39;
+            return true;
         }
     }
 }
