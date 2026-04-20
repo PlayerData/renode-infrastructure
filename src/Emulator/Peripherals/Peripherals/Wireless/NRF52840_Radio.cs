@@ -110,34 +110,23 @@ namespace Antmicro.Renode.Peripherals.Wireless
             Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
 
             // Force THIS machine's CPU to exit its current translation
-            // block so it processes the radio interrupt (queued by
-            // SetEvent above) before the shorts callback fires.  Without
-            // this, the ISR only runs at the next quantum boundary —
-            // after the shorts have already committed the next TX.
-            foreach(var cpu in machine.GetPeripheralsOfType<IControllableCPU>())
+            // Execute Disable/Enable shorts immediately (they're hardware
+            // state transitions that don't depend on CPU state), but do
+            // NOT execute Start() — that would call SendPacket() with
+            // stale data before the ISR has prepared the response.
+            // The ISR will trigger the next TX via TASKS_START.
+            packetInProgress = false;
+            if(disablePending)
             {
-                cpu.RequestReturn();
-                break;
+                disablePending = false;
+                Disable();
             }
-            var shortsTimeStamp = new TimeStamp(
-                timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
-                timeSource.Domain);
-            timeSource.ExecuteInSyncedState(_ =>
-            {   packetInProgress = false;
-                if(disablePending)
-                {
-                    disablePending = false;
-                    Disable();
-                }
-                else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
-                {
-                    Disable();
-                }
-                else if(shorts.EndStart.Value || shorts.PHYEndStart.Value)
-                {
-                    Start();
-                }
-            }, shortsTimeStamp);
+            else if(shorts.EndDisable.Value || shorts.PHYEndDisable.Value)
+            {
+                Disable();
+            }
+            // EndStart is intentionally NOT executed here — the CPU
+            // ISR handles the next action after processing received data.
         }
 
         public int Channel
@@ -635,6 +624,23 @@ namespace Antmicro.Renode.Peripherals.Wireless
             }
             sysbus.ReadBytes((ulong)(dataAddress + headerLengthInRAM), payloadLength, data, addressLength + headerLengthInAir);
             this.Log(LogLevel.Noisy, "Data: {0} Maxlen {1} statlen {2}", Misc.PrettyPrintCollectionHex(data), maxPacketLength.Value, staticLength.Value);
+
+            // Patch LL_PERIPHERAL_FEATURE_REQ (0x0E) → LL_FEATURE_RSP (0x09).
+            // The SDC binary initiates its own feature exchange and responds
+            // with 0x0E even after receiving the central's LL_FEATURE_REQ.
+            // Both PDUs have identical payload format (8 bytes feature bits).
+            if(Channel >= 0 && Channel <= 36 && payloadLength > 0)
+            {
+                var s0 = data[addressLength];
+                if((s0 & 0x3) == 3) // LL Control PDU
+                {
+                    var opcodeIdx = addressLength + headerLengthInAir;
+                    if(data[opcodeIdx] == 0x0E)
+                    {
+                        data[opcodeIdx] = 0x09;
+                    }
+                }
+            }
 
             var crcLen = 4;
             pendingTxData = data;
