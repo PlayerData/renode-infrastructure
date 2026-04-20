@@ -26,11 +26,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
         // via HandleTimeDomainEvent, which can push the reception into a
         // later virtual-time quantum and therefore a later connection
         // event.  Synchronous delivery matches real hardware behaviour.
-        // Synchronous delivery ensures packets arrive while the
-        // receiver's radio is still in RxIdle, before the BLE
-        // controller closes the connection event window.  Deferred
-        // delivery via HandleTimeDomainEvent arrives too late.
-        protected override bool SynchronousDelivery => true;
+        // Deferred delivery via HandleTimeDomainEvent fires within
+        // the receiver's CPU execution context, allowing the radio's
+        // RequestReturn() call to force the CPU to process the ISR
+        // before the shorts callback fires.
+        protected override bool SynchronousDelivery => false;
 
         // Relax channel matching to compensate for simulation timing
         // drift.  In real BLE both radios are tuned to the same channel

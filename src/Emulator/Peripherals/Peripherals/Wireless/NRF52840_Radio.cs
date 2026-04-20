@@ -12,6 +12,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -108,10 +109,16 @@ namespace Antmicro.Renode.Peripherals.Wireless
             SetEvent(Events.CRCOk);
             Timer0?.WriteDoubleWord(0x048, 0x1);  // TASKS_CAPTURE[2]
 
-            // Delay shorts to give the CPU ISR time to process the
-            // received PDU and update the TX buffer.  The SDC's radio
-            // ISR needs several thousand instructions to handle packet
-            // processing, SN/NESN updates, and TX buffer preparation.
+            // Force THIS machine's CPU to exit its current translation
+            // block so it processes the radio interrupt (queued by
+            // SetEvent above) before the shorts callback fires.  Without
+            // this, the ISR only runs at the next quantum boundary —
+            // after the shorts have already committed the next TX.
+            foreach(var cpu in machine.GetPeripheralsOfType<IControllableCPU>())
+            {
+                cpu.RequestReturn();
+                break;
+            }
             var shortsTimeStamp = new TimeStamp(
                 timeSource.ElapsedVirtualTime + TimeInterval.FromMicroseconds(10),
                 timeSource.Domain);
