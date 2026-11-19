@@ -194,7 +194,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             ;
 
             Registers.Mode.Define(this, name: "MODE")
-                .WithValueField(0, 4, name: "MODE") // just RW
+                .WithValueField(0, 4, out mode, name: "MODE")
                 .WithReservedBits(4, 24)
             ;
 
@@ -456,16 +456,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var timeSource = machine.LocalTimeSource;
             var now = timeSource.ElapsedVirtualTime;
 
-            // @note  Transmit times assume 1M PHY. Low level BLE firmware
-            //        usually takes into account the active phy when calculating
-            //        timing delays, so we might need to do that.
-
             // Bit-counter
             var bcMatchTime = now + TimeInterval.FromMicroseconds(bitCountCompare.Value);
             var bcMatchTimeStamp = new TimeStamp(bcMatchTime, timeSource.Domain);
 
             // End event
-            var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * 8);
+            var microsecondsPerByte = (mode.Value == NrfMode2Mbit || mode.Value == BleMode2Mbit) ? 4u : 8u;
+            var endTime = now + TimeInterval.FromMicroseconds(packetLen * microsecondsPerByte);
             var endTimeStamp = new TimeStamp(endTime, timeSource.Domain);
 
             var disableTime = endTime + TimeInterval.FromMicroseconds(10);
@@ -500,19 +497,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // seem important
             timeSource.ExecuteInSyncedState(_ =>
             {
+                var disableShort = shorts.EndDisable.Value;
+
                 SetEvent(Events.Payload);
                 SetEvent(Events.End);
                 SetEvent(Events.CRCOk);
-            }, endTimeStamp);
 
-            // BLE stacks use disabled event as common processing trigger.
-            timeSource.ExecuteInSyncedState(_ =>
-            {
-                if(shorts.EndDisable.Value)
+                timeSource.ExecuteInSyncedState(__ =>
                 {
-                    Disable();
-                }
-            }, disableTimeStamp);
+                    if(disableShort)
+                    {
+                        Disable();
+                    }
+                }, disableTimeStamp);
+            }, endTimeStamp);
         }
 
         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
@@ -562,6 +560,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private IFlagRegisterField frequencyMap;
         private IValueRegisterField frequency;
         private IValueRegisterField packetPointer;
+        private IValueRegisterField mode;
 
         private readonly IFlagRegisterField[] events;
         private readonly InterruptManager<Events> interruptManager;
@@ -612,6 +611,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
            { 2480, 39 },
         };
 
+        private const uint NrfMode2Mbit = 1;
+        private const uint BleMode2Mbit = 4;
         private const int DefaultRSSISample = 10;
 
         private struct Shorts
