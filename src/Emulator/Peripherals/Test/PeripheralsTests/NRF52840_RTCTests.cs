@@ -73,6 +73,26 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.Contains(EventsTick, routedEvents, "TICK must coincide with the COUNTER increment at 61us");
         }
 
+        [Test]
+        public void ShouldKeepTickInPhaseWithCounterAfterManyTicks()
+        {
+            rtc.WriteDoubleWord(TasksStart, 1);
+            AdvanceByMicroseconds(3000000);
+            rtc.WriteDoubleWord(EventEnableSet, TickBit);
+            var counterBefore = rtc.ReadDoubleWord(Counter);
+            routedEvents.Clear();
+
+            var stepsUntilCounterChanged = 0;
+            while(rtc.ReadDoubleWord(Counter) == counterBefore && stepsUntilCounterChanged < 40)
+            {
+                Assert.IsEmpty(routedEvents, "TICK fired before COUNTER incremented");
+                AdvanceByMicroseconds(1);
+                stepsUntilCounterChanged++;
+            }
+
+            Assert.Contains(EventsTick, routedEvents, "TICK must fire in the same step as the COUNTER increment");
+        }
+
         private void AdvanceByMicroseconds(ulong microseconds)
         {
             ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(microseconds));

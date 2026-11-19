@@ -294,8 +294,8 @@ namespace Antmicro.Renode.Time
             entry.ValueResiduum = entryTicks.Fractional;
             if(isReached)
             {
-                entry.Value = entry.Period;
-                entry.ValueResiduum = Fraction.Zero;
+                var overshoot = (entryTicks.Integer - entry.Value) % Math.Max(entry.Period, 1UL);
+                entry.Value = entry.Period - overshoot;
                 entry = entry.With(enabled: entry.Enabled & (entry.WorkMode != WorkMode.OneShot));
             }
             else
@@ -324,8 +324,7 @@ namespace Antmicro.Renode.Time
             if(entry.Value >= entry.Period)
             {
                 isReached = true;
-                entry.Value = 0;
-                entry.ValueResiduum = Fraction.Zero;
+                entry.Value = entry.Period == 0 ? 0 : (entry.Value - entry.Period) % entry.Period;
                 entry = entry.With(enabled: entry.Enabled & (entry.WorkMode != WorkMode.OneShot));
             }
 
