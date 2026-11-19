@@ -254,7 +254,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(taskEndpoint[id] != 0)
             {
                 this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering task at 0x{2:X}", id, eventEndpoint[id], taskEndpoint[id]);
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(taskEndpoint[id], 1));
+                var task = taskEndpoint[id];
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(task, 1));
             }
             else
             {
@@ -263,7 +264,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(forkEndpoint[id] != 0)
             {
                 this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering fork task at 0x{2:X}", id, eventEndpoint[id], forkEndpoint[id]);
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(forkEndpoint[id], 1));
+                var forkTask = forkEndpoint[id];
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(forkTask, 1));
             }
         }
 
