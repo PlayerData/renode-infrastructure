@@ -23,7 +23,6 @@ using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
-using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
 
 using ELFSharp.ELF;
@@ -39,8 +38,6 @@ namespace Antmicro.Renode.Peripherals.Bus
     /// <summary>
     ///     The <c>SystemBus</c> is the main system class, where all data passes through.
     /// </summary>
-    [Icon("sysbus")]
-    [ControllerMask(typeof(IPeripheral))]
     public sealed partial class SystemBus : IBusController, IDisposable, IHasPreservableState
     {
         internal SystemBus(IMachine machine)
@@ -390,7 +387,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         }
 
         /// <remarks>Doesn't include peripherals registered using NullRegistrationPoints.</remarks>
-        public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral peripheral, ICPU context = null)
+        public IEnumerable<BusRangeRegistration> GetRegistrationPoints(IBusPeripheral peripheral, IPeripheral context)
         {
             return GetAccessiblePeripheralsForContext(context)
                 .Where(x => x.Peripheral == peripheral)
@@ -552,12 +549,12 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false, bool overridePeripheralAccesses = false)
+        public void Tag(Range range, string tag, ulong defaultValue = 0, bool pausing = false, bool silent = false, bool overridePeripheralAccesses = false, bool oneShot = false, bool throwException = false)
         {
             var intersectings = tags.Where(x => x.Key.Intersects(range)).ToArray();
             if(intersectings.Length == 0)
             {
-                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent, OverridePeripheralAccesses = overridePeripheralAccesses });
+                tags.Add(range, new TagEntry { Name = tag, DefaultValue = defaultValue, Silent = silent, OverridePeripheralAccesses = overridePeripheralAccesses, OneShot = oneShot, ThrowException = throwException });
 
                 var onMappedMemory  = GetRegisteredPeripherals()
                     .Where(x => x.Peripheral is MappedMemory)
@@ -584,24 +581,29 @@ namespace Antmicro.Renode.Peripherals.Bus
             var parentName = intersectings[0].Value.Name;
             var parentDefaultValue = intersectings[0].Value.DefaultValue;
             var parentSilent = intersectings[0].Value.Silent;
+            var parentThrowException = intersectings[0].Value.ThrowException;
             var parentPausing = pausingTags.Contains(parentName);
             if(!parentRange.Contains(range))
             {
                 throw new RecoverableException(string.Format(
                     "Currently subtag has to be completely contained in other tag, in this case {0}.", parentName));
             }
+            if(oneShot)
+            {
+                throw new RecoverableException(string.Format("Subtags can't be set as oneShot. This tag would overlap with {0}", parentName));
+            }
             RemoveTag(parentRange.StartAddress);
             var parentRangeAfterSplitSizeLeft = range.StartAddress - parentRange.StartAddress;
             if(parentRangeAfterSplitSizeLeft > 0)
             {
-                Tag(new Range(parentRange.StartAddress, parentRangeAfterSplitSizeLeft), parentName, parentDefaultValue, parentPausing, parentSilent);
+                Tag(new Range(parentRange.StartAddress, parentRangeAfterSplitSizeLeft), parentName, parentDefaultValue, parentPausing, parentSilent, throwException: parentThrowException);
             }
             var parentRangeAfterSplitSizeRight = parentRange.EndAddress - range.EndAddress;
             if(parentRangeAfterSplitSizeRight > 0)
             {
-                Tag(new Range(range.EndAddress + 1, parentRangeAfterSplitSizeRight), parentName, parentDefaultValue, parentPausing, parentSilent);
+                Tag(new Range(range.EndAddress + 1, parentRangeAfterSplitSizeRight), parentName, parentDefaultValue, parentPausing, parentSilent, throwException: parentThrowException);
             }
-            Tag(range, $"{parentName}/{tag}", defaultValue, pausing, silent, overridePeripheralAccesses);
+            Tag(range, $"{parentName}{TagNestSymbol}{tag}", defaultValue, pausing, silent, overridePeripheralAccesses, throwException: throwException);
         }
 
         public void ApplySVD(string path)
@@ -827,7 +829,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         {
             cpu = null;
             cpuState = default;
-            if(!threadLocalContext.InUse || !threadLocalContext.InitiatorState.HasValue)
+            if(!threadLocalContext.InitiatorState.HasValue)
             {
                 return false;
             }
@@ -866,7 +868,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public bool TryGetTransactionInitiator(out IPeripheral initiator)
         {
-            if(threadLocalContext.InUse && threadLocalContext.Initiator != null)
+            if(threadLocalContext.Initiator != null)
             {
                 initiator = threadLocalContext.Initiator;
                 return true;
@@ -905,12 +907,12 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        public void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null)
+        public void WriteBytes(byte[] bytes, ulong address, long count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
-            WriteBytes(bytes, address, 0, count, onlyMemory, context);
+            WriteBytes(bytes, address, 0, count, onlyMemory, context, cpuState);
         }
 
-        public void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null)
+        public void WriteBytes(byte[] bytes, ulong address, int startingIndex, long count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             if(context is BaseCPU cpu && cpu.CheckExternalPermissions(address) == 0)
             {
@@ -922,7 +924,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 return;
             }
 
-            using(SetLocalContext(context))
+            using(SetLocalContext(context, cpuState))
             {
                 var targets = FindTargets(address, checked((ulong)count), context);
                 if(onlyMemory)
@@ -931,15 +933,20 @@ namespace Antmicro.Renode.Peripherals.Bus
                 }
                 foreach(var target in targets)
                 {
-                    var multibytePeripheral = target.What.Peripheral as IMultibyteWritePeripheral;
-                    if(multibytePeripheral != null)
+                    if(target.What.Peripheral is IMultibyteWritePeripheral multibytePeripheral)
                     {
-                        checked
+                        if(target.What.Peripheral is IAbsoluteAddressAware absoluteAddressAwarePeripheral)
                         {
-                            var invalidationCtx = delayedInvalidation ? multibytePeripheral as IHasDelayedInvalidationContext : null;
-                            using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                            absoluteAddressAwarePeripheral.SetAbsoluteAddress(address);
+                        }
+
+                        var invalidationCtx = delayedInvalidation ? multibytePeripheral as IHasDelayedInvalidationContext : null;
+                        using(var ctx = invalidationCtx?.EnterDelayedInvalidationContext())
+                        {
+                            checked
                             {
-                                multibytePeripheral.WriteBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), bytes, startingIndex + (int)target.SourceIndex, (int)target.SourceLength);
+                                var peripheralAddress = (long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset);
+                                multibytePeripheral.WriteBytes(peripheralAddress, bytes, startingIndex + (int)target.SourceIndex, (int)target.SourceLength);
                             }
                         }
                     }
@@ -947,16 +954,16 @@ namespace Antmicro.Renode.Peripherals.Bus
                     {
                         for(var i = 0UL; i < target.SourceLength; ++i)
                         {
-                            WriteByte(target.Offset + i, bytes[target.SourceIndex + (ulong)startingIndex + i]);
+                            WriteByte(target.Offset + i, bytes[target.SourceIndex + (ulong)startingIndex + i], context, cpuState);
                         }
                     }
                 }
             }
         }
 
-        public void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null)
+        public void WriteBytes(byte[] bytes, ulong address, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
-            WriteBytes(bytes, address, bytes.Length, onlyMemory, context);
+            WriteBytes(bytes, address, bytes.Length, onlyMemory, context, cpuState);
         }
 
         public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
@@ -964,14 +971,14 @@ namespace Antmicro.Renode.Peripherals.Bus
             return ReadBytes((ulong)offset, count, context: context);
         }
 
-        public byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null)
+        public byte[] ReadBytes(ulong address, int count, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             var result = new byte[count];
-            ReadBytes(address, count, result, 0, onlyMemory, context);
+            ReadBytes(address, count, result, 0, onlyMemory, context, cpuState);
             return result;
         }
 
-        public void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null)
+        public void ReadBytes(ulong address, int count, byte[] destination, int startIndex, bool onlyMemory = false, IPeripheral context = null, ulong? cpuState = null)
         {
             if(context is BaseCPU cpu && cpu.CheckExternalPermissions(address) == 0)
             {
@@ -983,7 +990,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 return;
             }
 
-            using(SetLocalContext(context))
+            using(SetLocalContext(context, cpuState))
             {
                 var targets = FindTargets(address, checked((ulong)count), context);
                 if(onlyMemory)
@@ -992,23 +999,124 @@ namespace Antmicro.Renode.Peripherals.Bus
                 }
                 foreach(var target in targets)
                 {
-                    var memory = target.What.Peripheral as MappedMemory;
-                    if(memory != null)
+                    if(target.What.Peripheral is IMultibyteWritePeripheral multibytePeripheral)
                     {
+                        if(target.What.Peripheral is IAbsoluteAddressAware absoluteAddressAwarePeripheral)
+                        {
+                            absoluteAddressAwarePeripheral.SetAbsoluteAddress(address);
+                        }
+
                         checked
                         {
-                            memory.ReadBytes(checked((long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset)), (int)target.SourceLength, destination, startIndex + (int)target.SourceIndex);
+                            var peripheralAddress = (long)(target.Offset - target.What.RegistrationPoint.Range.StartAddress + target.What.RegistrationPoint.Offset);
+                            var buffer = multibytePeripheral.ReadBytes(peripheralAddress, (int)target.SourceLength);
+                            Array.Copy(buffer, 0, destination, startIndex + (int)target.SourceIndex, (int)target.SourceLength);
                         }
                     }
                     else
                     {
                         for(var i = 0UL; i < target.SourceLength; ++i)
                         {
-                            destination[checked((ulong)startIndex) + target.SourceIndex + i] = ReadByte(target.Offset + i, context);
+                            destination[checked((ulong)startIndex) + target.SourceIndex + i] = ReadByte(target.Offset + i, context, cpuState);
                         }
                     }
                 }
             }
+        }
+
+        public ulong[] FindBytes(byte[] pattern, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
+        {
+            // 1 MiB
+            const ulong bufferSize = 1 << 20;
+
+            if(pattern == null || pattern.Length == 0)
+            {
+                throw new RecoverableException("Pattern cannot be null or empty.");
+            }
+            if((ulong)pattern.Length > bufferSize)
+            {
+                throw new RecoverableException(string.Format("Pattern cannot be larger than {0}.", bufferSize));
+            }
+
+            var results = new List<ulong>();
+
+            var overlapBytes = (ulong)pattern.Length - 1;
+            var buffer = new byte[bufferSize + overlapBytes];
+
+            var memories = GetRegistrationsForPeripheralType<IMemory>(context)
+                .Select(x => x.RegistrationPoint.Range)
+                .OrderBy(range => range.StartAddress);
+
+            // `MinimalRangesCollection` merges adjecent memories into a single range,
+            // thus allowing us to find patterns spanning two memories
+            var minimalCombinedRanges = new MinimalRangesCollection(memories);
+
+            foreach(var range in minimalCombinedRanges)
+            {
+                var regionStart = Math.Max(range.StartAddress, startAddress);
+                var regionEnd = Math.Min(range.EndAddress, endAddress ?? range.EndAddress);
+
+                if(regionStart > regionEnd)
+                {
+                    continue;
+                }
+                if(regionEnd - regionStart + 1 < (ulong)pattern.Length)
+                {
+                    continue;
+                }
+
+                var address = regionStart;
+                while(address <= regionEnd - (ulong)pattern.Length + 1)
+                {
+                    var bytesLeftInRegion = regionEnd - address + 1;
+                    var toRead = (int)Math.Min(bufferSize + overlapBytes, bytesLeftInRegion);
+
+                    ReadBytes(address, toRead, buffer, 0, onlyMemory: true, context: context);
+
+                    // Slide window across the whole buffer
+                    for(var i = 0; i < toRead - pattern.Length + 1; i++)
+                    {
+                        // Try to match pattern
+                        var matched = true;
+                        for(var j = 0; j < pattern.Length; j++)
+                        {
+                            if(buffer[i + j] != pattern[j])
+                            {
+                                matched = false;
+                                break;
+                            }
+                        }
+                        if(matched)
+                        {
+                            results.Add(address + (ulong)i);
+                        }
+                    }
+
+                    address += bufferSize;
+                }
+            }
+
+            return results.ToArray();
+        }
+
+        public ulong[] FindBytes(string hexString, ulong startAddress = 0, ulong? endAddress = null, IPeripheral context = null)
+        {
+            if(string.IsNullOrEmpty(hexString))
+            {
+                throw new RecoverableException("Pattern cannot be null or empty.");
+            }
+
+            byte[] bytes;
+            try
+            {
+                bytes = Convert.FromHexString(hexString.Replace(" ", "").ReplaceLineEndings(""));
+            }
+            catch(FormatException exception)
+            {
+                throw new RecoverableException(exception.Message);
+            }
+
+            return FindBytes(bytes, startAddress, endAddress, context);
         }
 
         /// <summary>
@@ -1068,14 +1176,9 @@ namespace Antmicro.Renode.Peripherals.Bus
                 .FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
         }
 
-        public IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null)
+        public IPeripheral WhatPeripheralIsAt(ulong address, IPeripheral context = null, ulong? initiatorState = null)
         {
-            var registered = WhatIsAt(address, context);
-            if(registered != null)
-            {
-                return registered.Peripheral;
-            }
-            return null;
+            return GetBusRegistered(address, context, initiatorState)?.Peripheral;
         }
 
         /// <summary>Checks what is at a given address.</summary>
@@ -1093,7 +1196,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         /// </returns>
         public IBusRegistered<IBusPeripheral> WhatIsAt(ulong address, IPeripheral context = null)
         {
-            return GetAccessiblePeripheralsForContext(context).FirstOrDefault(x => x.RegistrationPoint.Range.Contains(address));
+            return GetBusRegistered(address, context);
         }
 
         public IEnumerable<IBusRegistered<IBusPeripheral>> GetRegistrationsForPeripheralType<T>(IPeripheral context = null)
@@ -1161,6 +1264,11 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public void Register(IBusPeripheral peripheral, BusRangeRegistration registrationPoint)
         {
+            if(peripheral is IHasBusRegistrationConstraints constraints)
+            {
+                registrationPoint.RegisterForEachContext(context => constraints.ValidateRegistrationPoint(registrationPoint, context));
+            }
+
             if(!peripheralAccessLocks.TryGetValue(peripheral.GetHashCode(), out var lockObject))
             {
                 lockObject = new object();
@@ -1235,6 +1343,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
             }
+            if(peripheral is IHasBusRegistrationConstraints constraints)
+            {
+                constraints.ValidateRegistrationPoint(newRegistration, context);
+            }
 
             var busRegisteredEntries = peripheralsCollectionByContext[context].Peripherals.Where(x => x.Peripheral == peripheral && x.RegistrationPoint.Initiator == context).ToList();
             if(busRegisteredEntries.Count == 0)
@@ -1275,7 +1387,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 AddMappingsForPeripheral(peripheral, newRegistration, context);
             }
 
-            if(peripheral is ArrayMemory)
+            if(peripheral is IExecutableIO)
             {
                 foreach(var cpu in GetCPUsForContext<ICPUWithMappedMemory>(context))
                 {
@@ -1429,7 +1541,11 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
+        public IEnumerable<KeyValuePair<Range, TagEntry>> Tags => tags;
+
         public event Action<IMachine> OnSymbolsChanged;
+
+        public const string TagNestSymbol = "->";
 
         private static void ThrowIfNotAllMemory(IEnumerable<PeripheralLookupResult> targets)
         {
@@ -1446,7 +1562,8 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private static MappedSegmentWrapper FromRegistrationPointToSegmentWrapper(IMappedSegment segment, BusRangeRegistration registrationPoint, ICPUWithMappedMemory context)
         {
-            if(segment.StartingOffset >= registrationPoint.Range.Size + registrationPoint.Offset)
+            if(segment.StartingOffset + segment.Size <= registrationPoint.Offset
+                || segment.StartingOffset >= registrationPoint.Range.Size + registrationPoint.Offset)
             {
                 return null;
             }
@@ -1528,7 +1645,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private bool TryGetCurrentCPUId(out int cpuId)
         {
-            if(threadLocalContext.InUse && threadLocalContext.Initiator is ICPU cpu)
+            if(threadLocalContext.Initiator is ICPU cpu)
             {
                 cpuId = idByCpu[cpu];
                 return true;
@@ -1670,6 +1787,24 @@ namespace Antmicro.Renode.Peripherals.Bus
             return context != null ? locals.Concat(peripheralsCollectionByContext[null].Peripherals) : locals;
         }
 
+        /// <summary>
+        /// The method gets peripheral registered at the given address for the given context and falls back to searching the global (`null`) context
+        /// if no peripheral is found in a peripheral collection for given non-null `context` and `initiatorState`.
+        /// </summary>
+        /// <remarks>
+        /// This method has much better performance than calling `GetAccessiblePeripheralsForContext` and filtering its results because
+        /// `PeripheralCollection.FindBusRegistered` uses an optimized registration lookup.
+        /// </remarks>
+        private IBusRegistered<IBusPeripheral> GetBusRegistered(ulong address, IPeripheral context, ulong? initiatorState = null)
+        {
+            IBusRegistered<IBusPeripheral> localBusRegistered = null;
+            if(context is not null || initiatorState is not null)
+            {
+                localBusRegistered = peripheralsCollectionByContext.GetValue(context, initiatorState).FindBusRegistered(address);
+            }
+            return localBusRegistered ?? peripheralsCollectionByContext[null].FindBusRegistered(address);
+        }
+
         private void FillAccessMethodsWithTaggedMethods(IBusPeripheral peripheral, string tag, ref PeripheralAccessMethods methods)
         {
             methods.Peripheral = peripheral;
@@ -1763,7 +1898,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
             // We need to pass in Endianess as a default because at this point the peripheral
             // is not yet associated with a machine.
-            Endianess periEndianess = peripheral.GetEndianness(Endianess);
+            var periEndianess = peripheral.GetEndianness(Endianess);
             // Note that the condition for applying ReadByteUsingDoubleWordBigEndian et al is different than the condition
             // for byte-swapping correctly-sized accesses! The former is needed for all big-endian peripherals, the
             // latter - only in the cross-endianness case. This is to ensure that on a big-endian bus, reading a byte
@@ -2234,7 +2369,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             lockedPeripherals = new HashSet<IPeripheral>();
             lockedRangesCollectionByContext = new ContextKeyDictionary<MinimalRangesCollection, IReadOnlyMinimalRangesCollection>(() => new MinimalRangesCollection());
             mappingsForPeripheral = new Dictionary<IBusPeripheral, List<MappedSegmentWrapper>>();
-            tags = new Dictionary<Range, TagEntry>();
+            tags = new SortedList<Range, TagEntry>(new RangeOrderedByStartAddressComparer());
             svdDevices = new List<SVDParser>();
             pausingTags = new HashSet<string>();
             PostDeserializationInitStructures();
@@ -2347,15 +2482,35 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private bool TryGetTag(ulong address, out TagEntry? foundTag)
         {
-            // The `return` inside is intentional; we just want to find the first tag.
-            // `FirstOrDefault` isn't used cause the default `Range` is a valid `<0, 0>` range.
-            // `Any` + `First` aren't used to avoid analyzing `tags` keys up to the matching one twice.
-            // `ToArray` isn't used to avoid analyzing all `tags` keys since we only use the first one.
-            foreach(var tag in tags.Where(x => x.Key.Contains(address)).Select(x => x.Value))
+            var tagIdx = tags.Keys.BinarySearch(r => address.CompareTo(r.StartAddress));
+            if(tagIdx >= 0)
             {
-                foundTag = tag;
+                // Direct hit - the address is the start address of a tag
+                foundTag = tags.Values[tagIdx];
+                if(foundTag.Value.OneShot)
+                {
+                    tags.RemoveAt(tagIdx);
+                }
                 return true;
             }
+            if(tagIdx == -1)
+            {
+                // The address is below the start address of the first tag, so it can't be in any tag
+                foundTag = null;
+                return false;
+            }
+            var earlierTagRange = tags.Keys[~tagIdx - 1];
+            if(earlierTagRange.Contains(address))
+            {
+                // The tag with the start address earlier than us contians us
+                foundTag = tags.Values[~tagIdx - 1];
+                if(foundTag.Value.OneShot)
+                {
+                    tags.RemoveAt(~tagIdx - 1);
+                }
+                return true;
+            }
+            // The earlier tag ends before the address
             foundTag = null;
             return false;
         }
@@ -2373,6 +2528,12 @@ namespace Antmicro.Renode.Peripherals.Bus
         private ulong ReportNonExistingRead(ulong address, TagEntry? tag, SysbusAccessWidth type)
         {
             Interlocked.Increment(ref unexpectedReads);
+            if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.ThrowException
+                || (UnhandledAccessBehaviour == UnhandledAccessBehaviour.ThrowExceptionIfNotTagged && tag == null)
+                || (tag?.ThrowException ?? false))
+            {
+                throw new BusAccessException(BusAccessError.AddressError);
+            }
             var tagged = tag is TagEntry;
             var defaultValue = tag?.DefaultValue ?? default(ulong);
             var silent = tag?.Silent ?? false;
@@ -2415,6 +2576,12 @@ namespace Antmicro.Renode.Peripherals.Bus
         private void ReportNonExistingWrite(ulong address, ulong value, TagEntry? tag, SysbusAccessWidth type)
         {
             Interlocked.Increment(ref unexpectedWrites);
+            if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.ThrowException
+                || (UnhandledAccessBehaviour == UnhandledAccessBehaviour.ThrowExceptionIfNotTagged && tag == null)
+                || (tag?.ThrowException ?? false))
+            {
+                throw new BusAccessException(BusAccessError.AddressError);
+            }
             if(UnhandledAccessBehaviour == UnhandledAccessBehaviour.DoNotReport)
             {
                 return;
@@ -2464,7 +2631,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private IEnumerable<PeripheralCollection> AllPeripherals => peripheralsCollectionByContext.GetAllDistinctValues();
 
-        private Dictionary<Range, TagEntry> tags;
+        private SortedList<Range, TagEntry> tags;
         private Dictionary<ICPU, SymbolLookup> localLookups;
         private SymbolLookup globalLookup;
         [Transient]
@@ -2607,11 +2774,22 @@ namespace Antmicro.Renode.Peripherals.Bus
             private readonly ICPUWithMappedMemory context;
         }
 
+        public struct TagEntry
+        {
+            public string Name;
+            public ulong DefaultValue;
+            public bool Silent;
+            public bool OverridePeripheralAccesses;
+            public bool OneShot;
+            public bool ThrowException;
+        }
+
         private class ThreadLocalContext : IDisposable
         {
             public ThreadLocalContext()
             {
-                context = new ThreadLocal<Tuple<IPeripheral, ulong?>>(() => null, true);
+                // We don't need values from other threads which is why `trackAllValues: false`.
+                localContextStack = new ThreadLocal<ContextStack>(static () => new ContextStack(), trackAllValues: false);
                 emptyDisposable.Disable();
             }
 
@@ -2621,28 +2799,32 @@ namespace Antmicro.Renode.Peripherals.Bus
                 {
                     return emptyDisposable;
                 }
-                var previousContext = context.Value;
-                context.Value = Tuple.Create(cpu, initiatorState);
-                return DisposableWrapper.New(() =>
-                {
-                    context.Value = previousContext;
-                });
+                localContextStack.Value.Push((cpu, initiatorState));
+                return localContextStack.Value;
             }
 
             public void Dispose()
             {
-                context.Dispose();
+                localContextStack.Dispose();
             }
 
-            public bool InUse => context.Value != null;
+            public bool InUse => localContextStack.Value.Count > 0;
 
-            public IPeripheral Initiator => context.Value.Item1;
+            public IPeripheral Initiator => InUse ? localContextStack.Value.Peek().Initiator : null;
 
-            public ulong? InitiatorState => context.Value.Item2;
+            public ulong? InitiatorState => InUse ? localContextStack.Value.Peek().InitiatorState : null;
 
-            private readonly ThreadLocal<Tuple<IPeripheral, ulong?>> context;
+            private readonly ThreadLocal<ContextStack> localContextStack;
 
             private static readonly DisposableWrapper emptyDisposable = new DisposableWrapper();
+
+            private class ContextStack : Stack<(IPeripheral Initiator, ulong? InitiatorState)>, IDisposable
+            {
+                public void Dispose()
+                {
+                    _ = Pop();
+                }
+            }
         }
 
         // It doesn't implement IDictionary because serialization doesn't work correctly for dictionaries without two generic parameters.
@@ -2828,11 +3010,7 @@ namespace Antmicro.Renode.Peripherals.Bus
             private readonly TValue globalAllAccess;
         }
 
-        private
-#if NET
-        readonly
-#endif
-        struct FoundRegistrationInfo
+        private readonly struct FoundRegistrationInfo
         {
             public FoundRegistrationInfo(BusRangeRegistration registrationPoint, PeripheralCollection collection, PeripheralAccessMethods accessMethods)
             {
@@ -2854,12 +3032,9 @@ namespace Antmicro.Renode.Peripherals.Bus
             public ulong SourceLength;
         }
 
-        private struct TagEntry
+        private struct RangeOrderedByStartAddressComparer : IComparer<Range>
         {
-            public string Name;
-            public ulong DefaultValue;
-            public bool Silent;
-            public bool OverridePeripheralAccesses;
+            public int Compare(Range a, Range b) => a.StartAddress.CompareTo(b.StartAddress);
         }
     }
 }

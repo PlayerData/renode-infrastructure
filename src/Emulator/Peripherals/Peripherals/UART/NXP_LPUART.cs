@@ -8,19 +8,22 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using Antmicro.Migrant;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.UART
 {
-    public class NXP_LPUART : UARTBaseWithFrameInfo, IUARTWithBufferState, ILINController, IBytePeripheral, IDoubleWordPeripheral, IKnownSize
+    public class NXP_LPUART : IUARTWithFrameInfo, IUARTWithFrameInfo<ushort>, IUARTWithBufferState, ILINController, IBytePeripheral, IDoubleWordPeripheral, IKnownSize, IProvidesRegisterCollection<DoubleWordRegisterCollection>
     {
-        public NXP_LPUART(IMachine machine, long frequency = 8000000, bool hasGlobalRegisters = true, bool hasFifoRegisters = true, uint fifoSize = DefaultFIFOSize, bool separateIRQs = false) : base(machine)
+        public NXP_LPUART(IMachine machine, long frequency = 8000000, bool hasGlobalRegisters = true, bool hasFifoRegisters = true, uint fifoSize = DefaultFIFOSize, bool separateIRQs = false)
         {
+            this.machine = machine;
             this.frequency = frequency;
             this.hasGlobalRegisters = hasGlobalRegisters;
             this.separateIRQs = separateIRQs;
@@ -30,7 +33,10 @@ namespace Antmicro.Renode.Peripherals.UART
             SeparateRxIRQ = new GPIO();
             TransmitDMA = new GPIO();
             ReceiveDMA = new GPIO();
-            txQueue = new Queue<byte>();
+            txQueue = new Queue<ushort>();
+            rxQueue = new Queue<(ushort, UARTFrame)>();
+            intermediateRxQueue = new Queue<(ushort, UARTFrame)>();
+
             if(!Misc.IsPowerOfTwo(fifoSize))
             {
                 throw new ConstructionException($"The `{nameof(fifoSize)}` argument must be a power of 2, given: {fifoSize}.");
@@ -75,7 +81,7 @@ namespace Antmicro.Renode.Peripherals.UART
                             oversamplingRatio.Value = current;
                         }
                     })
-                .WithTaggedFlag("M10 / 10-bit Mode select", 29)
+                .WithFlag(29, out bits10Select, name: "M10 / 10-bit Mode select")
                 .WithTaggedFlag("MAEN2 / Match Address Mode Enable 2", 30)
                 .WithTaggedFlag("MAEN1 / Match Address Mode Enable 1", 31)
                 .WithWriteCallback((_, __) =>
@@ -96,7 +102,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(17, out framingErrorFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "FE / Framing Error Flag")
                 .WithFlag(18, out noiseFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "NF / Noise Flag")
                 .WithFlag(19, out receiverOverrun, FieldMode.Read | FieldMode.WriteOneToClear, name: "OR / Receiver Overrun Flag")
-                .WithTaggedFlag("IDLE / Idle Line Flag", 20)
+                .WithTaggedFlag("IDLE / Idle Line Flag", 20, silent: true)
                 // Despite the name below flag should be set when Watermark level is exceeded
                 .WithFlag(21, FieldMode.Read,
                     valueProviderCallback: _ => (BufferState == BufferState.Ready || BufferState == BufferState.Full),
@@ -118,12 +124,12 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(1, out parityEnabled, name: "PE / Parity Enable")
                 .WithTaggedFlag("ILT / Idle Line Type Select", 2)
                 .WithTaggedFlag("WAKE / Receiver Wakeup Method Select", 3)
-                .WithTaggedFlag("M / 9-Bit or 8-Bit Mode Select", 4)
+                .WithFlag(4, out bits9Select, name: "M / 9-Bit or 8-Bit Mode Select")
                 .WithFlag(5, out receiverSource, name: "RSRC / Receiver Source Select")
                 .WithTaggedFlag("DOZEEN / Doze Enable", 6)
                 .WithFlag(7, out loopMode, name: "LOOPS / Loop Mode Select")
                 .WithTag("IDLECFG / Idle Configuration", 8, 3)
-                .WithTaggedFlag("M7 / 7-Bit Mode Select", 11)
+                .WithFlag(11, out bits7Select, name: "M7 / 7-Bit Mode Select")
                 .WithReservedBits(12, 2)
                 .WithTaggedFlag("MA2IE / Match 2 Interrupt Enable", 14)
                 .WithTaggedFlag("MA1IE / Match 1 Interrupt Enable", 15)
@@ -151,20 +157,38 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(27, out overrunInterruptEnable, name: "ORIE / Overrun Interrupt Enable")
                 .WithTaggedFlag("TXINV / Transmit Data Inversion", 28)
                 .WithFlag(29, out transmissionPinDirectionOutNotIn, name: "TXDIR / TXD Pin Direction in Single-Wire Mode")
-                .WithTaggedFlag("R9T8 / Receive Bit 9 / Transmit Bit 8", 30)
-                .WithTaggedFlag("R8T9 / Receive Bit 8 / Transmit Bit 9", 31)
+                .WithFlag(30, name: "R9T8 / Receive Bit 9 / Transmit Bit 8",
+                    writeCallback: (_, value) => bits9and10 |= (ushort)((value ? 1 : 0) << 8),
+                    valueProviderCallback: _ =>
+                    {
+                        if(TryGetCharacter(out var data, peek: true))
+                        {
+                            return BitHelper.IsBitSet(data, 9);
+                        }
+                        return false;
+                    })
+                .WithFlag(31, name: "R8T9 / Receive Bit 8 / Transmit Bit 9",
+                    writeCallback: (_, value) => bits9and10 |= (ushort)((value ? 1 : 0) << 9),
+                    valueProviderCallback: _ =>
+                    {
+                        if(TryGetCharacter(out var data, peek: true))
+                        {
+                            return BitHelper.IsBitSet(data, 8);
+                        }
+                        return false;
+                    })
                 .WithWriteCallback((_, __) => UpdateGPIOOutputs())
             );
 
             registersMap.Add(CommonRegistersOffset + (long)CommonRegs.Data, new DoubleWordRegister(this)
-                .WithValueField(0, 9, valueProviderCallback: _ =>
+                .WithValueField(0, 10, valueProviderCallback: _ =>
                     {
                         dmaReceivedData = ReceiveDmaState;
 
                         if(!this.TryGetCharacter(out var b))
                         {
                             receiveFifoUnderflowInterrupt.Value = true;
-                            this.Log(LogLevel.Warning, "Trying to read form an empty fifo");
+                            this.Log(LogLevel.Debug, "Trying to read form an empty fifo");
                         }
                         else
                         {
@@ -173,7 +197,7 @@ namespace Antmicro.Renode.Peripherals.UART
                             OnBufferStateChanged();
                         }
 
-                        return b;
+                        return b & ((1u << CharacterBits) - 1);
                     },
                     writeCallback: (_, val) =>
                     {
@@ -185,11 +209,11 @@ namespace Antmicro.Renode.Peripherals.UART
                         }
                         else if(transmitterEnabled.Value)
                         {
-                            TransmitData((byte)val);
+                            TransmitData((ushort)val);
                         }
                         else if(txQueue.Count < txMaxBytes)
                         {
-                            txQueue.Enqueue((byte)val);
+                            txQueue.Enqueue((ushort)val);
 
                             UpdateFillLevels();
                         }
@@ -203,7 +227,6 @@ namespace Antmicro.Renode.Peripherals.UART
 
                         UpdateGPIOOutputs();
                     })
-                .WithReservedBits(10, 1)
                 .WithTaggedFlag("IDLINE / Idle Line", 11)
                 .WithFlag(12, FieldMode.Read, valueProviderCallback: _ => BufferState == BufferState.Empty, name: "RXEMPT / Receive Buffer Empty")
                 .WithFlag(13, out transmitSpecialCharacter, name: "FRETSC / Frame Error / Transmit Special Character")
@@ -306,7 +329,7 @@ namespace Antmicro.Renode.Peripherals.UART
                          * way as Fifo depth (FIFO_SIZE) or real count clipped at the maximum possible to express with just 3 bits.
                          * As the available drivers suggest the second approach -  this is what we use here.
                          * But this should be adjusted if proven to not work or if the manual gets updated */
-                        return (uint)Math.Min(Count, 0b111);
+                        return (uint)Math.Min(RxCount, 0b111);
                     }, name: "RXCOUNT / Receive Counter")
                     .WithReservedBits(27, 5)
                     .WithWriteCallback((_, __) => UpdateGPIOOutputs())
@@ -318,19 +341,20 @@ namespace Antmicro.Renode.Peripherals.UART
                 );
             }
 
-            registers = new DoubleWordRegisterCollection(this, registersMap);
+            RegistersCollection = new DoubleWordRegisterCollection(this, registersMap);
         }
 
-        public override void Reset()
+        public void Reset()
         {
             lock(locker)
             {
-                base.Reset(); // reset clears all buffered characters
-                registers.Reset();
+                RegistersCollection.Reset();
                 txQueue.Clear();
+                rxQueue.Clear();
                 latestBufferState = BufferState.Empty;
                 rxMaxBytes = 1;
                 txMaxBytes = 1;
+                bits9and10 = 0;
                 UpdateBufferState();
                 UpdateGPIOOutputs();
                 reset.Value = true;
@@ -350,7 +374,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     return 0;
                 }
 
-                return (byte)registers.Read(offset);
+                return (byte)RegistersCollection.Read(offset);
             }
         }
 
@@ -364,7 +388,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     return;
                 }
 
-                registers.Write(offset, value);
+                RegistersCollection.Write(offset, value);
             }
         }
 
@@ -372,7 +396,7 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             lock(locker)
             {
-                return registers.Read(offset);
+                return RegistersCollection.Read(offset);
             }
         }
 
@@ -380,19 +404,196 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             lock(locker)
             {
-                registers.Write(offset, value);
+                RegistersCollection.Write(offset, value);
             }
         }
 
-        public override void WriteChar(byte data)
+        public void WriteChar(ushort data)
         {
-            WriteChar(data, null);
+            (this as IUARTWithFrameInfo<ushort>).WriteChar(data, null);
         }
 
         /// <remark>
         /// `frame` is null when the standard UART api is in use, so care has to be taken to do null checks before using it
         /// </remark>
-        public override void WriteChar(byte data, UARTFrame frame)
+        public void WriteChar(ushort data, UARTFrame frame)
+        {
+            if(charReceiveDelay == 0)
+            {
+                // No delay - enqueue immediatelly
+                RealWriteChar(data, frame);
+            }
+            else
+            {
+                lock(intermediateRxQueue)
+                {
+                    // There is a delay - push the data onto a separate queue that will be
+                    // drained from a managed thread
+                    intermediateRxQueue.Enqueue((data, frame));
+                    if(intermediateRxQueue.Count == 1)
+                    {
+                        // Restart here to ensure that the next character will be delivered at least
+                        // after `CharacterReceiveDelay`. We only need to restart after pushing to an empty
+                        // queue
+                        rxThread.Restart();
+                    }
+                }
+            }
+        }
+
+        public void WriteChar(byte value)
+        {
+            (this as IUARTWithFrameInfo<ushort>).WriteChar(value);
+        }
+
+        public void WriteChar(byte value, UARTFrame frame)
+        {
+            (this as IUARTWithFrameInfo<ushort>).WriteChar(value, frame);
+        }
+
+        public void ReceiveLINBreak()
+        {
+            linBreakDetect.Value |= linBreakDetection.Value;
+            UpdateGPIOOutputs();
+        }
+
+        public Bits StopBits => stopBitNumberSelect.Value ? Bits.Two : Bits.One;
+
+        public Parity ParityBit => parityEnabled.Value ? Parity.None : parityType.Value ? Parity.Odd : Parity.Even;
+
+        public uint BaudRate => (baudRateModuloDivisor.Value == 0)
+            ? 0
+            : (uint)(frequency / ((oversamplingRatio.Value == 0 ? 16 : (uint)(oversamplingRatio.Value + 1)) * (uint)baudRateModuloDivisor.Value));
+
+        public BufferState BufferState { get; private set; }
+
+        public long Size => 0x800;
+
+        public GPIO IRQ { get; }
+
+        public GPIO SeparateRxIRQ { get; }
+
+        public GPIO ReceiveDMA { get; }
+
+        public GPIO TransmitDMA { get; }
+
+        public bool InjectFramingError { get; set; }
+
+        public bool InjectNoiseError { get; set; }
+
+        public bool InjectParityError { get; set; }
+
+        public uint CharacterReceiveDelayMicroseconds
+        {
+            get
+            {
+                lock(intermediateRxQueue)
+                {
+                    return charReceiveDelay;
+                }
+            }
+
+            set
+            {
+                lock(intermediateRxQueue)
+                {
+                    if(charReceiveDelay != value)
+                    {
+                        charReceiveDelay = value;
+                        ConfigureRxThread();
+                    }
+                }
+            }
+        }
+
+        public DoubleWordRegisterCollection RegistersCollection { get; }
+
+        [field: Transient]
+        public event Action<byte> CharReceived;
+
+        event Action<ushort> IUART<ushort>.CharReceived
+        {
+            add => WordReceived += value;
+            remove => WordReceived -= value;
+        }
+
+        public event Action BroadcastLINBreak;
+
+        public event Action<BufferState> BufferStateChanged;
+
+        private void TransmitData(ushort data)
+        {
+            if(!loopMode.Value)
+            {
+                TransmitCharacter(data);
+            }
+            else if(receiverSource.Value)
+            {
+                if(!transmissionPinDirectionOutNotIn.Value)
+                {
+                    this.Log(LogLevel.Warning, "Data not transmitted, uart operates in Single-Wire mode and txPin set to input. (value: 0x{0:X})", data);
+                    return;
+                }
+                TransmitCharacter(data);
+            }
+            else
+            {
+                WriteChar(data);
+            }
+        }
+
+        private bool TryGetCharacter(out ushort data, bool peek = false)
+        {
+            return TryGetCharacterWithFrame(out data, out _, peek);
+        }
+
+        private bool TryGetCharacterWithFrame(out ushort data, out UARTFrame frame, bool peek = false)
+        {
+            lock(locker)
+            {
+                if(rxQueue.Count == 0)
+                {
+                    data = default;
+                    frame = default;
+                    return false;
+                }
+                if(peek)
+                {
+                    (data, frame) = rxQueue.Peek();
+                }
+                else
+                {
+                    (data, frame) = rxQueue.Dequeue();
+                }
+                return true;
+            }
+        }
+
+        private void TransmitCharacter(ushort data)
+        {
+            var bits = CharacterBits;
+            if(bits > 8)
+            {
+                data |= bits9and10;
+                bits9and10 = 0;
+                WordReceived?.Invoke((ushort)(data & ((1u << bits) - 1)));
+            }
+            else
+            {
+                CharReceived?.Invoke((byte)data);
+            }
+        }
+
+        private void ClearBuffer()
+        {
+            lock(locker)
+            {
+                rxQueue.Clear();
+                UpdateGPIOOutputs();
+            }
+        }
+
+        private void RealWriteChar(ushort data, UARTFrame frame)
         {
             lock(locker)
             {
@@ -423,9 +624,9 @@ namespace Antmicro.Renode.Peripherals.UART
                     return;
                 }
 
-                if(Count >= rxMaxBytes)
+                if(RxCount >= rxMaxBytes)
                 {
-                    this.Log(LogLevel.Debug, "RX FIFO is overflowing, but we are buffering characters, reached {0} bytes", Count + 1);
+                    this.Log(LogLevel.Debug, "RX FIFO is overflowing, but we are buffering characters, reached {0} bytes", RxCount + 1);
                 }
 
                 // If this method is called without a UARTFrame, but we still have an error to inject we need to create a dummy frame
@@ -469,77 +670,10 @@ namespace Antmicro.Renode.Peripherals.UART
                 InjectNoiseError = false;
                 InjectParityError = false;
 
-                base.WriteChar(data, frame);
+                rxQueue.Enqueue((data, frame));
                 UpdateBufferState();
                 UpdateErrorFlags();
                 UpdateGPIOOutputs();
-            }
-        }
-
-        public void ReceiveLINBreak()
-        {
-            linBreakDetect.Value |= linBreakDetection.Value;
-            UpdateGPIOOutputs();
-        }
-
-        public override Bits StopBits => stopBitNumberSelect.Value ? Bits.Two : Bits.One;
-
-        public override Parity ParityBit => parityEnabled.Value ? Parity.None : parityType.Value ? Parity.Odd : Parity.Even;
-
-        public override uint BaudRate => (baudRateModuloDivisor.Value == 0)
-            ? 0
-            : (uint)(frequency / ((oversamplingRatio.Value == 0 ? 16 : (uint)(oversamplingRatio.Value + 1)) * (uint)baudRateModuloDivisor.Value));
-
-        public BufferState BufferState { get; private set; }
-
-        public long Size => 0x800;
-
-        public GPIO IRQ { get; }
-
-        public GPIO SeparateRxIRQ { get; }
-
-        public GPIO ReceiveDMA { get; }
-
-        public GPIO TransmitDMA { get; }
-
-        public bool InjectFramingError { get; set; }
-
-        public bool InjectNoiseError { get; set; }
-
-        public bool InjectParityError { get; set; }
-
-        public event Action BroadcastLINBreak;
-
-        public event Action<BufferState> BufferStateChanged;
-
-        protected override void CharWritten()
-        {
-            UpdateGPIOOutputs();
-        }
-
-        protected override void QueueEmptied()
-        {
-            UpdateGPIOOutputs();
-        }
-
-        protected void TransmitData(byte data)
-        {
-            if(!loopMode.Value)
-            {
-                TransmitCharacter(data);
-            }
-            else if(receiverSource.Value)
-            {
-                if(!transmissionPinDirectionOutNotIn.Value)
-                {
-                    this.Log(LogLevel.Warning, "Data not transmitted, uart operates in Single-Wire mode and txPin set to input. (value: 0x{0:X})", data);
-                    return;
-                }
-                TransmitCharacter(data);
-            }
-            else
-            {
-                WriteChar(data);
             }
         }
 
@@ -585,10 +719,6 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void UpdateErrorFlags()
         {
-            // Error flags are based on the next character in the RX FIFO, start with them cleared
-            noiseFlag.Value = false;
-            framingErrorFlag.Value = false;
-            parityErrorFlag.Value = false;
             if(TryGetCharacterWithFrame(out var data, out var frame, peek: true) && frame != null)
             {
                 if(frame.StopBits != this.StopBits)
@@ -647,7 +777,11 @@ namespace Antmicro.Renode.Peripherals.UART
             }
 
             dmaReceiveInProgress = true;
-            while(ReceiveDmaState)
+            // Due to the fact that DMAs in Renode generally transfer data instantly it is very likely
+            // that any RX error interrupts generated by this peripheral will not be serviced before
+            // a DMA interrupt, which could cause the errors to be lost. In case a RX error is detected
+            // we choose to not continue triggering the DMA to let the software handle it.
+            while(ReceiveDmaState && !HasRxError)
             {
                 this.DebugLog("Setting ReceiveDMA request to true");
                 dmaReceivedData = false;
@@ -718,7 +852,7 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void UpdateBufferState()
         {
-            var count = Count;
+            var count = RxCount;
             if(count == 0)
             {
                 BufferState = BufferState.Empty;
@@ -730,8 +864,16 @@ namespace Antmicro.Renode.Peripherals.UART
                 if((ulong)count > receiveWatermark)
                 {
                     BufferState = BufferState.Ready;
-                    return;
                 }
+                else if(count >= rxMaxBytes)
+                {
+                    BufferState = BufferState.Full;
+                }
+                else
+                {
+                    BufferState = BufferState.Empty;
+                }
+                return;
             }
 
             if(count >= rxMaxBytes)
@@ -742,13 +884,80 @@ namespace Antmicro.Renode.Peripherals.UART
             BufferState = BufferState.Ready;
         }
 
+        private void ConfigureRxThread()
+        {
+            lock(intermediateRxQueue)
+            {
+                if(charReceiveDelay != 0)
+                {
+                    rxThread?.Dispose();
+                    rxThread = machine.ObtainManagedThread(() =>
+                    {
+                        if(receiverEnabled.Value && intermediateRxQueue.TryDequeue(out var entry))
+                        {
+                            var (data, frame) = entry;
+                            RealWriteChar(data, frame);
+                        }
+                    }, TimeInterval.FromMicroseconds(charReceiveDelay));
+                }
+                else
+                {
+                    // Drain the intermediate FIFO into the real RX FIFO after disabling the delay
+                    // to ensure that data doesn't get lost acidentally.
+                    while(intermediateRxQueue.TryDequeue(out var entry))
+                    {
+                        var (data, frame) = entry;
+                        RealWriteChar(data, frame);
+                    }
+                    rxThread?.Dispose();
+                    rxThread = null;
+                }
+            }
+        }
+
         private bool TransmitDmaState => transmitterDMAEnabled.Value && transmitDataRegisterEmpty.Value;
 
-        private bool ReceiveDmaState => receiverDMAEnabled.Value && BufferState == BufferState.Full;
+        private bool ReceiveDmaState => receiverDMAEnabled.Value && (BufferState == BufferState.Full || (receiveFifoEnabled.Value && BufferState == BufferState.Ready));
 
         private long CommonRegistersOffset => hasGlobalRegisters ? 0x10 : 0x0;
 
         private long FifoRegistersOffset => 0x18 + CommonRegistersOffset;
+
+        private bool HasRxError => framingErrorFlag.Value || parityErrorFlag.Value || noiseFlag.Value;
+
+        private int CharacterBits
+        {
+            get
+            {
+                if(bits7Select.Value)
+                {
+                    return 7;
+                }
+                if(bits9Select.Value)
+                {
+                    return 9;
+                }
+                if(bits10Select.Value)
+                {
+                    return 10;
+                }
+                return 8;
+            }
+        }
+
+        private int RxCount
+        {
+            get
+            {
+                lock(locker)
+                {
+                    return rxQueue.Count;
+                }
+            }
+        }
+
+        [field: Transient]
+        private Action<ushort> WordReceived;
 
         private uint transmitWatermark;
         private uint receiveWatermark;
@@ -762,9 +971,15 @@ namespace Antmicro.Renode.Peripherals.UART
         private int rxMaxBytes = 1;
         private int txMaxBytes = 1;
 
+        private IManagedThread rxThread;
+        private uint charReceiveDelay;
+        private ushort bits9and10;
+
+        private readonly IMachine machine;
         private readonly object locker;
-        private readonly Queue<byte> txQueue;
-        private readonly DoubleWordRegisterCollection registers;
+        private readonly Queue<ushort> txQueue;
+        private readonly Queue<(ushort, UARTFrame)> rxQueue;
+        private readonly Queue<(ushort, UARTFrame)> intermediateRxQueue;
         private readonly IFlagRegisterField reset;
         private readonly IFlagRegisterField stopBitNumberSelect;
         private readonly IFlagRegisterField bothEdgeSampling;
@@ -801,6 +1016,9 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly IFlagRegisterField noiseFlag;
         private readonly IFlagRegisterField framingErrorFlag;
         private readonly IFlagRegisterField parityErrorFlag;
+        private readonly IFlagRegisterField bits7Select;
+        private readonly IFlagRegisterField bits10Select;
+        private readonly IFlagRegisterField bits9Select;
         private readonly long frequency;
         private readonly bool hasGlobalRegisters;
         private readonly bool separateIRQs;

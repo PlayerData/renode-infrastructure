@@ -6,9 +6,11 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU.GuestProfiling;
 using Antmicro.Renode.Utilities.Binding;
 
@@ -16,13 +18,28 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public abstract partial class TranslationCPU
     {
-        public void EnableProfiler(ProfilerType type, string filename, bool flushInstantly = false, bool enableMultipleTracks = true, long? fileSizeLimit = null, int? maximumNestedContexts = null, bool enableFrameTracking = false)
+        public void EnableProfiler(ProfilerType type, string filename, bool flushInstantly = false, bool? enableMultipleTracks = null, ulong? fileSizeLimit = null, uint? maximumNestedContexts = null, bool enableFrameTracking = false)
         {
+            if(enableFrameTracking && !SupportsFrameTracking())
+            {
+                throw new RecoverableException("Frame tracking method is not supported for this architecture.");
+            }
+
+            if(enableMultipleTracks == null)
+            {
+                // enableMultipleTracks wasn't set, enable it for profilers that support it
+                enableMultipleTracks = true;
+            }
+            else if(enableMultipleTracks.Value == true && type == ProfilerType.CollapsedStack)
+            {
+                throw new RecoverableException("Multiple tracks are not supported by Collapsed Stack profiler.");
+            }
+
             // Remove the old profiler if it was enabled
             if(profiler != null)
             {
-                ConfigureProfilerInterruptHooks(false);
-                profiler.Dispose();
+                this.InfoLog("New profiler added while there was already one present. Disposing previous profiler");
+                DisableProfiler();
             }
 
             try
@@ -34,30 +51,21 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new RecoverableException($"There was an error when preparing the profiler output file {filename}: {e.Message}");
             }
 
-            switch(type)
+            profiler = type switch
             {
-            case ProfilerType.Perfetto:
-                profiler = new PerfettoProfiler(this, filename, flushInstantly, enableMultipleTracks, fileSizeLimit, maximumNestedContexts);
-                break;
-            case ProfilerType.CollapsedStack:
-                if(enableFrameTracking)
-                {
-                    if(SupportsFrameTracking(type))
-                    {
-                        profiler = new FrameTrackingCollapsedStackProfiler(this, filename, flushInstantly, fileSizeLimit, maximumNestedContexts);
-                    }
-                    else
-                    {
-                        throw new RecoverableException("Frame tracking method is not supported for this set of options.");
-                    }
-                }
-                else
-                {
-                    profiler = new ControlTrackingCollapsedStackProfiler(this, filename, flushInstantly, fileSizeLimit, maximumNestedContexts);
-                }
-                break;
-            default:
-                throw new RecoverableException($"{type} is not a valid profiler output type");
+                ProfilerType.TraceEvent => new TraceEventProfiler(this, filename, flushInstantly, fileSizeLimit, maximumNestedContexts: maximumNestedContexts, enableMultipleTracks: enableMultipleTracks.Value),
+                ProfilerType.Perfetto => new PerfettoProfiler(this, filename, flushInstantly, fileSizeLimit, maximumNestedContexts: maximumNestedContexts, enableMultipleTracks: enableMultipleTracks.Value),
+                ProfilerType.CollapsedStack => new CollapsedStackProfiler(this, filename, flushInstantly, fileSizeLimit, maximumNestedContexts: maximumNestedContexts),
+                _ => throw new UnreachableException("Profiler type outside of enum")
+            };
+
+            if(enableFrameTracking)
+            {
+                profilerAdapter = new FrameTrackingProfilerAdapter(this, profiler);
+            }
+            else
+            {
+                profilerAdapter = new ControlTrackingProfilerAdapter(this, profiler);
             }
 
             FrameProfilerIgnoredSymbols = new HashSet<string>();
@@ -67,28 +75,67 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibEnableGuestProfiler(1);
         }
 
-        public void EnableProfilerCollapsedStack(string filename, bool flushInstantly = false, long? fileSizeLimit = null, int? maximumNestedContexts = null, bool enableFrameTracking = false)
+        public void EnableProfilerCollapsedStack(string filename, bool flushInstantly = false, ulong? fileSizeLimit = null, uint? maximumNestedContexts = null, bool enableFrameTracking = false)
         {
             // CollapsedStack format doesn't support multiple tracks
-            EnableProfiler(ProfilerType.CollapsedStack, filename, flushInstantly, false, fileSizeLimit, maximumNestedContexts, enableFrameTracking);
+            EnableProfiler(
+                ProfilerType.CollapsedStack,
+                filename,
+                flushInstantly,
+                enableMultipleTracks: false,
+                fileSizeLimit,
+                maximumNestedContexts,
+                enableFrameTracking
+            );
         }
 
-        public void EnableProfilerPerfetto(string filename, bool flushInstantly = false, bool enableMultipleTracks = true, long? fileSizeLimit = null, int? maximumNestedContexts = null)
+        public void EnableProfilerPerfetto(string filename, bool flushInstantly = false, bool enableMultipleTracks = true, ulong? fileSizeLimit = null, uint? maximumNestedContexts = null, bool enableFrameTracking = false)
         {
-            EnableProfiler(ProfilerType.Perfetto, filename, flushInstantly, enableMultipleTracks, fileSizeLimit, maximumNestedContexts);
+            EnableProfiler(
+                ProfilerType.Perfetto,
+                filename,
+                flushInstantly,
+                enableMultipleTracks,
+                fileSizeLimit,
+                maximumNestedContexts,
+                enableFrameTracking
+            );
+        }
+
+        public void EnableProfilerTraceEvent(string filename, bool flushInstantly = false, bool enableMultipleTracks = true, ulong? fileSizeLimit = null, uint? maximumNestedContexts = null, bool enableFrameTracking = false)
+        {
+            EnableProfiler(
+                ProfilerType.TraceEvent,
+                filename,
+                flushInstantly,
+                enableMultipleTracks,
+                fileSizeLimit,
+                maximumNestedContexts,
+                enableFrameTracking
+            );
         }
 
         public void DisableProfiler()
         {
-            if(profiler == null)
+            if(!GuestProfilerEnabled)
             {
                 throw new RecoverableException("The profiler is not enabled on this core");
             }
 
-            profiler.Dispose();
-            ConfigureProfilerInterruptHooks(false);
-            TlibEnableGuestProfiler(0);
-            profiler = null;
+            lock(profiler.MainLock)
+            {
+                // Other thread disposed of the profiler while waiting on a lock, return
+                if(!GuestProfilerEnabled)
+                {
+                    return;
+                }
+
+                ConfigureProfilerInterruptHooks(false);
+                TlibEnableGuestProfiler(0);
+                profiler.Dispose();
+                profiler = null;
+                profilerAdapter = null;
+            }
         }
 
         public void FlushProfiler()
@@ -98,7 +145,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new RecoverableException("The profiler is not enabled on this core");
             }
 
-            profiler.FlushBuffer();
+            profiler.Flush();
         }
 
         public string GetProfilerStack()
@@ -111,7 +158,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             return profiler.GetCurrentStack();
         }
 
+        public bool GuestProfilerEnabled => profiler != null;
+
         public BaseProfiler Profiler => profiler;
+
+        public BaseProfilerAdapter ProfilerAdapter => profilerAdapter;
 
         public HashSet<string> FrameProfilerIgnoredSymbols;
 
@@ -124,63 +175,64 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             // It is possible to execute stack change announcement from a currently executed translation block
             // even after disabling the profiler and flushing the translation cache
-            if(profiler == null)
+            if(profilerAdapter == null)
             {
                 return;
             }
             if(isFrameAdd != 0)
             {
-                profiler.StackFrameAdd(currentAddress, returnAddress, instructionsCount);
+                profilerAdapter.StackFrameAdd(currentAddress, returnAddress, instructionsCount);
             }
             else
             {
-                profiler.StackFramePop(currentAddress, returnAddress, instructionsCount);
+                profilerAdapter.StackFramePop(currentAddress, returnAddress, instructionsCount);
             }
         }
 
         [Export]
         protected void OnContextChange(ulong threadId)
         {
-            if(profiler == null)
+            if(profilerAdapter == null)
             {
                 return;
             }
-            profiler.OnContextChange(threadId);
+            profilerAdapter.OnContextChange(threadId);
         }
 
         [Export]
         protected void OnStackPointerChange(ulong address, ulong oldPointerValue, ulong newPointerValue, ulong instructionsCount)
         {
-            if(profiler == null)
+            if(profilerAdapter == null)
             {
                 return;
             }
-            profiler.OnStackPointerChange(address, oldPointerValue, newPointerValue, instructionsCount);
+            profilerAdapter.OnStackPointerChange(address, oldPointerValue, newPointerValue, instructionsCount);
         }
 
         private void ConfigureProfilerInterruptHooks(bool enabled)
         {
             if(enabled)
             {
-                this.AddHookAtInterruptBegin(profiler.InterruptEnter);
-                this.AddHookAtInterruptEnd(profiler.InterruptExit);
+                this.AddHookAtInterruptBegin(profilerAdapter.InterruptEnter);
+                this.AddHookAtInterruptEnd(profilerAdapter.InterruptExit);
             }
             else
             {
-                this.RemoveHookAtInterruptBegin(profiler.InterruptEnter);
-                this.RemoveHookAtInterruptEnd(profiler.InterruptExit);
+                this.RemoveHookAtInterruptBegin(profilerAdapter.InterruptEnter);
+                this.RemoveHookAtInterruptEnd(profilerAdapter.InterruptExit);
             }
         }
 
-        private bool SupportsFrameTracking(ProfilerType outputFormat)
+        private bool SupportsFrameTracking()
         {
-            bool isArm = Architecture.Contains("arm");
-            bool isSparc = Architecture.Contains("sparc");
-            bool isRiscV = Architecture.Contains("riscv");
-            return outputFormat == ProfilerType.CollapsedStack && (isArm || isSparc || isRiscV);
+            var isArm = Architecture.Contains("arm");
+            var isSparc = Architecture.Contains("sparc");
+            var isRiscV = Architecture.Contains("riscv");
+            return isArm || isSparc || isRiscV;
         }
 
         private BaseProfiler profiler;
+        private BaseProfilerAdapter profilerAdapter;
 
 #pragma warning disable 649
         [Import]
@@ -190,7 +242,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         public enum ProfilerType
         {
             CollapsedStack,
-            Perfetto
+            Perfetto,
+            TraceEvent
         }
     }
 }

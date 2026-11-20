@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2023 Western Digital Corporation
 //
 // This file is licensed under the MIT License.
@@ -20,11 +20,11 @@ using Antmicro.Renode.Utilities.GDB;
 
 namespace Antmicro.Renode.Core
 {
-    public interface IMachine : IEmulationElement
+    public interface IMachine : IEmulationElement, IIdentifiable, IHaltable
     {
         void AddUserStateHook(Func<string, bool> predicate, Action<string> hook);
 
-        void AppendDirtyAddresses(ICPU cpu, long[] addresses);
+        void AppendDirtyAddresses(TranslationCPU cpu, long[] addresses);
 
         void AttachGPIO(IPeripheral source, int sourceNumber, IGPIOReceiver destination, int destinationNumber, int? localReceiverNumber = null);
 
@@ -48,7 +48,7 @@ namespace Antmicro.Renode.Core
 
         string GetLocalName(IPeripheral peripheral);
 
-        long[] GetNewDirtyAddressesForCore(ICPU cpu);
+        long[] GetNewDirtyAddressesForCore(TranslationCPU cpu);
 
         IEnumerable<IPeripheral> GetParentPeripherals(IPeripheral peripheral);
 
@@ -96,7 +96,7 @@ namespace Antmicro.Renode.Core
 
         void RequestReset();
 
-        void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null);
+        void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false);
 
         void Reset();
 
@@ -113,6 +113,8 @@ namespace Antmicro.Renode.Core
         void StartGdbServer(SocketServerProvider terminal, IEnumerable<string> cpuNames = null);
 
         void StopGdbServer(int? port = null);
+
+        void StartMultiprocessGdbServer(int port, List<ICluster<ICpuSupportingGdb>> clusters, bool autostartEmulation = true);
 
         bool AttachConnectionAcceptedListenerToGdbStub(int port, Action<System.IO.Stream> listener);
 
@@ -142,6 +144,8 @@ namespace Antmicro.Renode.Core
 
         void ExchangeRegistrationPointForPeripheral(IPeripheral parent, IPeripheral child, IRegistrationPoint oldPoint, IRegistrationPoint newPoint);
 
+        void Abort();
+
         IPeripheral this[string name] { get; }
 
         IntPtr AtomicMemoryStatePointer { get; }
@@ -169,6 +173,8 @@ namespace Antmicro.Renode.Core
         Platform Platform { get; set; }
 
         bool IsPaused { get; }
+
+        bool IsAborted { get; }
 
         TimeStamp ElapsedVirtualTime { get; }
 

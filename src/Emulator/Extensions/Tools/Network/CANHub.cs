@@ -15,6 +15,7 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.CAN;
+using Antmicro.Renode.Testing;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
@@ -28,7 +29,7 @@ namespace Antmicro.Renode.Tools.Network
         }
     }
 
-    public sealed class CANHub : IExternal, IHasOwnLife, IConnectable<ICAN>, INetworkLog<ICAN>
+    public sealed class CANHub : IExternal, IConnectable<ICAN>, INetworkLog<ICAN>, IAnalyzable
     {
         public CANHub(bool loopback = false, bool useNetworkByteOrderForLogging = true)
         {
@@ -63,30 +64,14 @@ namespace Antmicro.Renode.Tools.Network
             }
         }
 
-        public void Start()
+        public void LoadDBC(string path)
         {
-            Resume();
-        }
-
-        public void Pause()
-        {
-            lock(sync)
-            {
-                started = false;
-            }
-        }
-
-        public void Resume()
-        {
-            lock(sync)
-            {
-                started = true;
-            }
+            DbcDecoder = new DBCDecoder(path);
         }
 
         public bool UseNetworkByteOrderForLogging { get; set; }
 
-        public bool IsPaused => !started;
+        public DBCDecoder DbcDecoder { get; private set; }
 
         public event Action<IExternal, ICAN, ICAN, byte[]> FrameTransmitted;
 
@@ -98,7 +83,16 @@ namespace Antmicro.Renode.Tools.Network
         {
             lock(sync)
             {
-                this.Log(LogLevel.Debug, "Received from {0}: {1}", sender.GetName(), message);
+                string senderName = null;
+                if(sender is CANTester)
+                {
+                    senderName = "CANTester";
+                }
+                else
+                {
+                    senderName = sender.GetName();
+                }
+                this.Log(LogLevel.Debug, "Received from {0}: {1}", senderName, message);
                 FrameReceived?.Invoke(this, sender, message);
 
                 byte[] frame = null;
@@ -115,20 +109,37 @@ namespace Antmicro.Renode.Tools.Network
                     FrameProcessed?.Invoke(this, sender, frame);
                 }
 
-                if(!started)
-                {
-                    return;
-                }
                 var vts = TimeDomainsManager.Instance.GetEffectiveVirtualTimeStamp();
                 foreach(var iface in attached.Where(x => (x != sender || loopback)))
                 {
-                    iface.GetMachine().HandleTimeDomainEvent(iface.OnFrameReceived, message, vts,
-                        frame != null ? () => FrameTransmitted?.Invoke(this, sender, iface, frame) : (Action)null);
+                    var isTimeSourceIndependent = iface is CANTester || iface is CANExternalControlBus;
+                    if(isTimeSourceIndependent)
+                    {
+                        TransmitToNonEmulatedInterface(iface, message, vts);
+                    }
+                    else
+                    {
+                        iface.GetMachine().HandleTimeDomainEvent(iface.OnFrameReceived, message, vts,
+                            frame != null ? () => FrameTransmitted?.Invoke(this, sender, iface, frame) : (Action)null);
+                    }
                 }
             }
         }
 
-        private bool started;
+        private void TransmitToNonEmulatedInterface(ICAN iface, CANMessageFrame message, TimeStamp virtualTimestamp)
+        {
+            if(EmulationManager.Instance.CurrentEmulation.IsStarted)
+            {
+                // CANTester does not belong to a machine so the event has to be handled from MasterTimeSource
+                EmulationManager.Instance.CurrentEmulation.MasterTimeSource.ExecuteInSyncedState(
+                    (_) => iface.OnFrameReceived(message), virtualTimestamp
+                );
+            }
+            else
+            {
+                iface.OnFrameReceived(message);
+            }
+        }
 
         private readonly List<ICAN> attached;
         private readonly Dictionary<ICAN, Action<CANMessageFrame>> handlers;

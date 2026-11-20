@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -15,7 +15,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Time
 {
-    public class BaseClockSource : IClockSource
+    public class BaseClockSource : IClockSource, IDisposable
     {
         public BaseClockSource(bool skipAdvancesHigherThanNearestLimit = false)
         {
@@ -42,7 +42,7 @@ namespace Antmicro.Renode.Time
         {
             lock(sync)
             {
-                if(clockEntries.FindIndex(x => x.Handler == entry.Handler) != -1)
+                if(FindClockEntryIndex(entry.Handler) != -1)
                 {
                     throw new ArgumentException("A clock entry with given handler already exists in the clock source.");
                 }
@@ -62,7 +62,7 @@ namespace Antmicro.Renode.Time
             lock(sync)
             {
                 UpdateLimits();
-                var indexOfEntry = clockEntries.FindIndex(x => x.Handler == handler);
+                var indexOfEntry = FindClockEntryIndex(handler);
 
                 if(indexOfEntry == -1)
                 {
@@ -91,7 +91,7 @@ namespace Antmicro.Renode.Time
         {
             lock(sync)
             {
-                var i = clockEntries.IndexOf(x => x.Handler == handler);
+                var i = FindClockEntryIndex(handler);
                 if(i == -1)
                 {
                     throw new KeyNotFoundException();
@@ -99,6 +99,10 @@ namespace Antmicro.Renode.Time
                 var result = clockEntries[i];
 
                 // Perform a full update of the clock entry we're getting
+                if(!result.Clocked)
+                {
+                    return result;
+                }
                 if(!result.Enabled)
                 {
                     return result;
@@ -124,11 +128,16 @@ namespace Antmicro.Renode.Time
                 }
                 clockEntries[i] = result;
 
+                if(elapsed == TimeInterval.Empty)
+                {
+                    return result;
+                }
+
                 // Clear elapsed and deposit it as unaccounted time on all other enabled clock entries
                 var triggerFullUpdate = false;
                 for(int j = 0; j < clockEntries.Count; ++j)
                 {
-                    if(i != j && clockEntries[j].Enabled)
+                    if(i != j && clockEntries[j].Enabled && clockEntries[j].Clocked)
                     {
                         unaccountedTimes[j] += elapsed;
                         triggerFullUpdate |= unaccountedTimes[j] >= nearestLimitIn;
@@ -152,12 +161,12 @@ namespace Antmicro.Renode.Time
             lock(sync)
             {
                 UpdateLimits();
-                var result = clockEntries.FirstOrDefault(x => x.Handler == handler);
-                if(result.Handler == null)
+                var i = FindClockEntryIndex(handler);
+                if(i == -1)
                 {
                     throw new KeyNotFoundException();
                 }
-                visitor(result);
+                visitor(clockEntries[i]);
             }
         }
 
@@ -167,7 +176,7 @@ namespace Antmicro.Renode.Time
             lock(sync)
             {
                 oldCount = clockEntries.Count;
-                var indexToRemove = clockEntries.FindIndex(x => x.Handler == handler);
+                var indexToRemove = FindClockEntryIndex(handler);
                 if(indexToRemove == -1)
                 {
                     return false;
@@ -237,6 +246,12 @@ namespace Antmicro.Renode.Time
                     AddClockEntry(entry);
                 }
             }
+        }
+
+        public void Dispose()
+        {
+            reupdateNeeded.Dispose();
+            updateAlreadyInProgress.Dispose();
         }
 
         public TimeInterval NearestLimitIn
@@ -393,6 +408,10 @@ namespace Antmicro.Renode.Time
                     {
                         var clockEntry = clockEntries[i];
                         var updateHandler = clockEntriesUpdateHandlers[i];
+                        if(!clockEntry.Clocked)
+                        {
+                            continue;
+                        }
                         if(!clockEntry.Enabled)
                         {
                             continue;
@@ -422,6 +441,19 @@ namespace Antmicro.Renode.Time
             {
                 updateAlreadyInProgress.Value = false;
             }
+        }
+
+        private int FindClockEntryIndex(Action handler)
+        {
+            // A simple for loop gives a huge performance boost over `clockEntries.FindIndex(x => x.Handler == handler)`.
+            for(var i = 0; i < clockEntries.Count; i++)
+            {
+                if(clockEntries[i].Handler == handler)
+                {
+                    return i;
+                }
+            }
+            return -1;
         }
 
         private void UpdateUpdateHandler(int clockEntryIndex)

@@ -227,14 +227,15 @@ namespace Antmicro.Renode.Core
             }
 
             var segments = elf.Segments.Where(x => x.Type == ELFSharp.ELF.Segments.SegmentType.Load).OfType<ELFSharp.ELF.Segments.Segment<T>>();
+            var thisLoadMin = SymbolAddress.MaxValue;
             foreach(var segment in segments)
             {
                 var loadAddress = useVirtualAddress ? segment.GetSegmentAddress() : segment.GetSegmentPhysicalAddress();
-                minLoadAddress = SymbolAddress.Min(minLoadAddress, loadAddress);
+                thisLoadMin = SymbolAddress.Min(thisLoadMin, loadAddress);
                 maxLoadAddress = SymbolAddress.Max(maxLoadAddress, loadAddress + segment.GetSegmentSize());
             }
 
-            var offset = (T)Convert.ChangeType(textAddress != null ? textAddress.Value - minLoadAddress.RawValue : 0, typeof(T));
+            var offset = (T)Convert.ChangeType(textAddress != null ? textAddress.Value - thisLoadMin.RawValue : 0, typeof(T));
             var thumb = elf.Machine == ELFSharp.ELF.Machine.ARM;
             var symtab = (SymbolTable<T>)symtabSection;
 
@@ -300,7 +301,6 @@ namespace Antmicro.Renode.Core
             }
         }
 
-        private SymbolAddress minLoadAddress = SymbolAddress.MaxValue;
         private SymbolAddress maxLoadAddress;
 
         /// <summary>
@@ -457,7 +457,7 @@ namespace Antmicro.Renode.Core
             /// <param name="source">Source.</param>
             private static void CopyCake(ICollection<Symbol> destination, ISymbolProvider source)
             {
-                Symbol cakeBase = source.Current;
+                var cakeBase = source.Current;
                 destination.Add(source.Consume()); // copy base
                 // "move cake" - while current old symbol is contained in base copy it
                 while(!source.Empty && cakeBase.Contains(source.Current))
@@ -846,7 +846,7 @@ namespace Antmicro.Renode.Core
 
                 public Symbol Consume()
                 {
-                    Symbol ret = Current;
+                    var ret = Current;
                     DiscardCurrentSymbol();
                     return ret;
                 }

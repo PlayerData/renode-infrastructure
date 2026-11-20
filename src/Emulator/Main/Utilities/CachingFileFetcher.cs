@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -30,11 +30,13 @@ namespace Antmicro.Renode.Utilities
     {
         static CachingFileFetcher()
         {
+#pragma warning disable SYSLIB0014 // ServicePointManager settings still apply to WebClient, which this class uses
             ServicePointManager.ServerCertificateValidationCallback = delegate
             {
                 return true;
             };
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12;
+#pragma warning restore SYSLIB0014
         }
 
         public CachingFileFetcher()
@@ -288,6 +290,15 @@ namespace Antmicro.Renode.Utilities
                     Logger.LogAs(this, LogLevel.Info, "Download done.");
                     return true;
                 }
+
+                if(attempts + 1 < attemptsLimit)
+                {
+                    // Back off exponentially so that a server that is briefly overloaded
+                    // or rate limiting gets time to recover before the next attempt
+                    var delay = TimeSpan.FromTicks(InitialRetryDelay.Ticks << attempts);
+                    Logger.LogAs(this, LogLevel.Info, "Retrying download in {0} s", delay.TotalSeconds);
+                    Thread.Sleep(delay);
+                }
             }
             while(++attempts < attemptsLimit);
 
@@ -364,16 +375,7 @@ namespace Antmicro.Renode.Utilities
             strBldr.AppendFormat("Downloading: {0}", uri);
             if(bytesDownloaded.HasValue && totalBytes.HasValue)
             {
-                // A workaround for a bug in Mono misreporting TotalBytesToReceive
-                // https://github.com/mono/mono/issues/9808
-                if(totalBytes == -1)
-                {
-                    strBldr.AppendFormat("\nProgress: {0}B downloaded", Misc.NormalizeBinary(bytesDownloaded.Value));
-                }
-                else
-                {
-                    strBldr.AppendFormat("\nProgress: {0}% ({1}B/{2}B)", progressPercentage, Misc.NormalizeBinary(bytesDownloaded.Value), Misc.NormalizeBinary(totalBytes.Value));
-                }
+                strBldr.AppendFormat("\nProgress: {0}% ({1}B/{2}B)", progressPercentage, Misc.NormalizeBinary(bytesDownloaded.Value), Misc.NormalizeBinary(totalBytes.Value));
             }
             if(speed != null)
             {
@@ -403,7 +405,7 @@ namespace Antmicro.Renode.Utilities
                     return false;
                 }
                 fileName = TemporaryFilesManager.Instance.GetTemporaryFile();
-                FileCopier.Copy(GetBinaryFileName(entry.Index), fileName, true);
+                File.Copy(GetBinaryFileName(entry.Index), fileName, true);
                 return true;
             }
         }
@@ -476,7 +478,7 @@ namespace Antmicro.Renode.Utilities
                     {
                         fileId = entry.Index;
                     }
-                    FileCopier.Copy(withFile, GetBinaryFileName(fileId), true);
+                    File.Copy(withFile, GetBinaryFileName(fileId), true);
 
                     // checksum will be 'null' if the uri pattern does not contain
                     // checksum/size information
@@ -560,6 +562,8 @@ namespace Antmicro.Renode.Utilities
 
         private const int DownloadAttempts = 5;
 
+        private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromSeconds(1);
+
         private class BinaryEntry
         {
             public BinaryEntry(int index, long size, byte[] checksum)
@@ -581,7 +585,7 @@ namespace Antmicro.Renode.Utilities
         {
             protected override WebRequest GetWebRequest(Uri uri)
             {
-                WebRequest w = base.GetWebRequest(uri);
+                var w = base.GetWebRequest(uri);
                 // This 15s timeout refers to the connection to the server, not the whole download duration
                 w.Timeout = 15 * 1000;
                 return w;

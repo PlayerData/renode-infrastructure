@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 using Antmicro.Renode.Debugging;
@@ -33,6 +34,12 @@ namespace Antmicro.Renode.Utilities
             }
 
             return -1;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsOneHot(ulong value)
+        {
+            return ((value & (value - 1)) == 0);
         }
 
         public static long Bit(byte b)
@@ -302,14 +309,10 @@ namespace Antmicro.Renode.Utilities
             reg ^= (newValue & mask);
         }
 
-        public static bool CalculateParity(uint word)
+        public static bool CalculateParity<T>(T value)
+            where T : IBinaryInteger<T>
         {
-            word ^= word >> 16;
-            word ^= word >> 8;
-            word ^= word >> 4;
-            word ^= word >> 2;
-            word ^= word >> 1;
-            return (word & 0x1) == 0x1;
+            return (T.PopCount(value) & T.One) == T.One;
         }
 
         public static void ClearBits(ref byte reg, params byte[] bits)
@@ -653,6 +656,31 @@ namespace Antmicro.Renode.Utilities
             return value;
         }
 
+        public static uint SignTruncate(int value, int size)
+        {
+            return (uint)value & (size == 32 ? uint.MaxValue : (1u << size) - 1u);
+        }
+
+        public static ulong SignTruncate(long value, int size)
+        {
+            return (ulong)value & (size == 64 ? ulong.MaxValue : (1ul << size) - 1ul);
+        }
+
+        public static long MinSignedValue(int size)
+        {
+            return -(1L << (size - 1));
+        }
+
+        public static long MaxSignedValue(int size)
+        {
+            return (1L << (size - 1)) - 1;
+        }
+
+        public static ulong MaxUnsignedValue(int size)
+        {
+            return size == 64 ? ulong.MaxValue : (1UL << size) - 1;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static uint CalculateMask(int width, int position)
         {
@@ -746,6 +774,51 @@ namespace Antmicro.Renode.Utilities
             DebugHelper.Assert(bitsCount >= 0);
             // Return count of bytes, including one which isn't full of bits.
             return (bitsCount - 1) / BitsPerByte + 1;
+        }
+
+        public static uint[] ToUInt32Array(byte[] data, bool littleEndian)
+        {
+            var res = new uint[(data.Length + 3) / 4];
+            for(var idx = 0; idx < data.Length / 4; idx += 1)
+            {
+                res[idx] = ToUInt32(data, idx * 4, 4, littleEndian);
+            }
+            // Handle partial value
+            if(data.Length % 4 != 0)
+            {
+                res[^1] = ToUInt32(data, data.Length & ~3, data.Length % 4, littleEndian);
+            }
+            return res;
+        }
+
+        public static void ToUintAndCopy(byte[] src, uint[] dst, bool littleEndian)
+        {
+            Array.Clear(dst, 0, dst.Length);
+            uint[] tmp = BitHelper.ToUInt32Array(src, littleEndian);
+
+            if(tmp.Length > dst.Length)
+            {
+                throw new ArgumentException("Source data is too large for the destination buffer", nameof(src));
+            }
+
+            Array.Copy(tmp, dst, tmp.Length);
+        }
+
+        public static byte[] ToBigEndianBytes(uint[] array)
+        {
+            var result = new byte[array.Length * 4];
+            int index = 0;
+            foreach(var val in array)
+            {
+                var bytes = BitConverter.GetBytes(val);
+                if(BitConverter.IsLittleEndian)
+                {
+                    Array.Reverse(bytes);
+                }
+                Buffer.BlockCopy(bytes, 0, result, index, 4);
+                index += 4;
+            }
+            return result;
         }
 
         public const int BitsPerByte = 8;
@@ -892,7 +965,7 @@ namespace Antmicro.Renode.Utilities
 
                 index = ~result;
                 return ((index == 0) || (fragments[index - 1].Offset + fragments[index - 1].Length <= f.Offset))
-                    && ((index == fragments.Count) || (f.Offset + f.Length <= fragments[index + 1].Offset));
+                    && ((index == fragments.Count) || (f.Offset + f.Length <= fragments[index].Offset));
             }
 
             private readonly List<Fragment> fragments;

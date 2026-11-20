@@ -6,9 +6,6 @@
 //
 
 using System;
-#pragma warning disable IDE0005
-using System.Reflection;
-#pragma warning restore IDE0005
 using System.Runtime.InteropServices;
 
 namespace Antmicro.Renode.Core
@@ -17,51 +14,32 @@ namespace Antmicro.Renode.Core
     {
         public static bool IsLinux()
         {
-#if NET
             return OperatingSystem.IsLinux();
-#elif PLATFORM_LINUX
-            return true;
-#else
-            return false;
-#endif
         }
 
         public static bool IsMacOS()
         {
-#if NET
             return OperatingSystem.IsMacOS();
-#elif PLATFORM_OSX
-            return true;
-#else
-            return false;
-#endif
         }
 
         public static bool IsWindows()
         {
-#if NET
             return OperatingSystem.IsWindows();
-#elif PLATFORM_WINDOWS
-            return true;
-#else
-            return false;
-#endif
         }
 
-        public static bool IsMono => Type.GetType("Mono.Runtime") != null;
+        public static bool RIDMatches(string rid)
+        {
+            var ridParts = rid.Split('-');
+            var os = ridParts[0];
+            var arch = ridParts.Length > 1 ? ridParts[1] : null;
+            return (os == "any" || (os == "unix" && !IsWindows()) || os == RIDOS) && (arch == null || arch == RIDArch);
+        }
 
         public static string Version
         {
             get
             {
-#if MONO
-                var getDisplayName = Type.GetType("Mono.Runtime").GetMethod("GetDisplayName", BindingFlags.NonPublic | BindingFlags.Static);
-                return $"Mono {(string)getDisplayName?.Invoke(null, null) ?? "(unknown version)"}";
-#elif NET || NET47_OR_GREATER
                 return RuntimeInformation.FrameworkDescription;
-#else
-                return $".NET Framework {Environment.Version}";
-#endif
             }
         }
 
@@ -80,13 +58,21 @@ namespace Antmicro.Renode.Core
         {
             get
             {
-#if NET
                 return RuntimeInformation.ProcessArchitecture.ToString();
-#else
-                return "X64";
-#endif
-
             }
         }
+
+        public static string RIDOS => IsLinux() ? "linux" : IsWindows() ? "win" : IsMacOS() ? "osx" : "any";
+
+        public static string RIDArch
+        {
+            get
+            {
+                var runtimeArch = RuntimeInformation.ProcessArchitecture;
+                return runtimeArch == Architecture.X64 ? "x64" : runtimeArch == Architecture.Arm64 ? "arm64" : runtimeArch == Architecture.Arm ? "arm" : null;
+            }
+        }
+
+        public static string RID => RIDArch != null ? $"{RIDOS}-{RIDArch}" : RIDOS;
     }
 }

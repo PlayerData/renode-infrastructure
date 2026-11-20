@@ -1,23 +1,20 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 
-using Antmicro.Migrant;
-using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
-using Antmicro.Renode.Peripherals.CPU.Assembler;
-using Antmicro.Renode.Peripherals.CPU.Disassembler;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Utilities;
 
@@ -55,7 +52,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
             };
 
-            InitLLVM();
+            LLVMDisasContainer = new LLVMDisas(this);
         }
 
         public override void Reset()
@@ -166,40 +163,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             return Enumerable.Range(0, 16).Select(idx => new CPURegister(idx, 32, isGeneral: true, isReadonly: false));
         }
 
+        public IEnumerable<CPURegister> GetAllRegisters()
+        {
+            return GetRegisters();
+        }
+
         public void EnterSingleStepModeSafely(HaltArguments args)
         {
             ExecutionMode = ExecutionMode.SingleStep;
         }
 
-        public string DisassembleBlock(ulong? addr = null, uint blockSize = 40)
-        {
-            if(disassembler == null)
-            {
-                throw new RecoverableException("Disassembly engine not available");
-            }
-
-            addr = addr ?? PC;
-
-            var opcodes = Bus.ReadBytes(addr.Value, (int)blockSize, true, context: this);
-            disassembler.DisassembleBlock(addr.Value, opcodes, triple: null, alternateDialect: false, text: out var result);
-            return result;
-        }
-
-        public uint AssembleBlock(ulong addr, string instructions)
-        {
-            if(assembler == null)
-            {
-                throw new RecoverableException("Assembler not available");
-            }
-
-            var result = assembler.AssembleBlock(addr, instructions, triple: null, alternateDialect: false);
-            Bus.WriteBytes(result, addr, true, context: this);
-            return (uint)result.Length;
-        }
-
         public string DumpRegisters()
         {
-            StringBuilder sb = new StringBuilder();
+            var sb = new StringBuilder();
             for(var i = 0; i < 16; ++i)
             {
                 if(i > 0)
@@ -268,7 +244,13 @@ namespace Antmicro.Renode.Peripherals.CPU
             return ExecutionResult.Ok;
         }
 
-        public string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
+        public string GetLLVMTriple(uint _) => AllLLVMTriples[0];
+
+        public string GetCurrentLLVMTriple(out ulong pc)
+        {
+            pc = PC;
+            return GetLLVMTriple(default);
+        }
 
         public override string Architecture => "msp430x";
 
@@ -283,6 +265,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         public string LLVMModel => Model;
 
         public Endianess DisassemblyHexFormatting => Endianess.LittleEndian;
+
+        public LLVMDisas LLVMDisasContainer { get; init; }
 
         public RegisterValue R13 { get; set; }
 
@@ -351,7 +335,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             case AccessWidth._8bit: return 8;
             case AccessWidth._16bit: return 16;
             case AccessWidth._20bit: return 20;
-            default: throw new Exception("unreachable");
+            default: throw new UnreachableException();
             }
         }
 
@@ -413,7 +397,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     return 0x0008;
 
                 default:
-                    throw new Exception("unreachable");
+                    throw new UnreachableException();
                 }
             case Registers.R3:
                 switch(addressingMode)
@@ -431,7 +415,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     return 0xFFFFF;
 
                 default:
-                    throw new Exception("unreachable");
+                    throw new UnreachableException();
                 }
             case Registers.R4:
                 return R4;
@@ -577,7 +561,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     return 0xFFFFF;
 
                 default:
-                    throw new Exception("unreachable");
+                    throw new UnreachableException();
                 }
             }
 
@@ -639,7 +623,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
         }
 
@@ -1474,7 +1458,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 break;
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             return true;
@@ -1508,7 +1492,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 break;
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
         }
 
@@ -1541,7 +1525,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 break;
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             return true;
@@ -1574,39 +1558,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return value;
 
             default:
-                throw new Exception("unreachable");
-            }
-        }
-
-        [PostDeserialization]
-        private void InitLLVM()
-        {
-            try
-            {
-                disassembler = new LLVMDisassembler(this);
-            }
-            catch(ArgumentOutOfRangeException)
-            {
-                this.Log(LogLevel.Warning, "Could not initialize disassembly engine");
-            }
-            try
-            {
-                assembler = new LLVMAssembler(this);
-            }
-            catch(ArgumentOutOfRangeException)
-            {
-                this.Log(LogLevel.Warning, "Could not initialize assembly engine");
+                throw new UnreachableException();
             }
         }
 
         private StatusFlags statusRegister;
         private ulong executedInstructions;
-
-        [Transient]
-        private LLVMAssembler assembler;
-
-        [Transient]
-        private LLVMDisassembler disassembler;
 
         private readonly List<PendingWatchpoint> pendingWatchpoints = new List<PendingWatchpoint>();
         private readonly SortedSet<int> pendingInterrupt = new SortedSet<int>();
@@ -1637,7 +1594,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     case AccessWidth._20bit:
                         return SysbusAccessWidth.DoubleWord;
                     default:
-                        throw new Exception("unreachable");
+                        throw new UnreachableException();
                     }
                 }
             }

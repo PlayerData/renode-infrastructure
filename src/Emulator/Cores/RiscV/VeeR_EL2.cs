@@ -23,8 +23,8 @@ namespace Antmicro.Renode.Peripherals.CPU
     public class VeeR_EL2 : RiscV32
     {
         public VeeR_EL2(IMachine machine, IRiscVTimeProvider timeProvider = null, ulong timerFrequency = 600000000, uint hartId = 0, PrivilegedArchitecture privilegedArchitecture = PrivilegedArchitecture.Priv1_12,
-            Endianess endianness = Endianess.LittleEndian, string cpuType = "rv32imc_zicsr_zifencei_zba_zbb_zbc_zbs", PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineUser, bool allowUnalignedAccesses = true)
-            : base(machine, cpuType, timeProvider, hartId, privilegedArchitecture, endianness, allowUnalignedAccesses: allowUnalignedAccesses, privilegeLevels: privilegeLevels, pmpNumberOfAddrBits: 30)
+            Endianess endianness = Endianess.LittleEndian, string cpuType = "rv32imc_zicsr_zifencei_zba_zbb_zbc_zbs", PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineUser, bool allowUnalignedAccesses = true, uint pmpEntryCount = 64)
+            : base(machine, cpuType, timeProvider, hartId, privilegedArchitecture, endianness, allowUnalignedAccesses: allowUnalignedAccesses, privilegeLevels: privilegeLevels, pmpNumberOfAddrBits: 30, pmpEntryCount: pmpEntryCount)
         {
             internalTimers = new InternalTimerBlock(machine, this, timerFrequency, (uint)CustomInterrupt.InternalTimer0, (uint)CustomInterrupt.InternalTimer1,
                     (ushort)CustomCSR.InternalTimerCounter0, (ushort)CustomCSR.InternalTimerBound0, (ushort)CustomCSR.InternalTimerControl0,
@@ -62,7 +62,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override void OnGPIO(int number, bool value)
         {
-            var sourceIsPIC = PIC.IRQ.Endpoints.Where(x => x.Receiver == this).Any(x => x.Number == number);
+            var sourceIsPIC = PIC != null && PIC.IRQ.Endpoints.Where(x => x.Receiver == this).Any(x => x.Number == number);
             if(isInFWHalt && sourceIsPIC && !PIC.MaxPriorityIRQ.IsSet && value)
             {
                 // Don't wake the core for non-highest priority PIC IRQ in fw_halt
@@ -78,6 +78,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                 throw new RecoverableException($"Another {pic.GetType().Name} has been registered to the given CPU already, only one is allowed per CPU");
             }
             PIC = pic;
+
+            TlibSetFastInterruptRedirect(PIC.FastInterruptRedirectEnabled);
 
             PIC.MaxPriorityIRQ.AddStateChangedHook(state =>
             {
@@ -108,6 +110,21 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public VeeR_EL2_PIC PIC { get; protected set; }
+
+        protected override void PicFastInterruptCaptureInner()
+        {
+            if(PIC == null)
+            {
+                this.ErrorLog("Attempted to perform {0}, but PIC is not registerd", nameof(PicFastInterruptCapture));
+                return;
+            }
+            if(!PIC.FastInterruptRedirectEnabled)
+            {
+                this.ErrorLog("Attempted to perform {0}, but PIC is registered without fast interrupt redirect option", nameof(PicFastInterruptCapture));
+                return;
+            }
+            PIC.CaptureHighestPrioritySourceAndItsLevel();
+        }
 
         /// <remarks>
         /// Called on interrupt start to make sure that normal RISC-V exceptions triggered without
@@ -218,6 +235,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         // 649:  Field '...' is never assigned to, and will always have its default value null
         [Import]
         private readonly Action TlibEnterWfi;
+
+        [Import(Name = "tlib_set_pic_fast_interrupt_redirect_mode")]
+        private readonly Action<bool> TlibSetFastInterruptRedirect;
 #pragma warning restore 649
 
         private const string WfiOpcodePattern = "00010000010100000000000001110011";
@@ -282,7 +302,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             public class InternalTimer : LimitTimer
             {
                 public InternalTimer(IMachine machine, VeeR_EL2 owner, InternalTimerBlock internalTimerBlock, bool isTimer1, ulong timerFrequency, uint interrupt, ushort counterCSR, ushort boundCSR, ushort controlCSR)
-                    : base(machine.ClockSource, timerFrequency, owner, localName: isTimer1 ? "InteralTimer1" : "InternalTimer0", limit: UInt32.MaxValue, enabled: true, direction: Direction.Ascending, eventEnabled: true)
+                    : base(machine.ClockSource, timerFrequency, owner, localName: isTimer1 ? "InternalTimer1" : "InternalTimer0", limit: UInt32.MaxValue, enabled: true, direction: Direction.Ascending, eventEnabled: true)
                 {
                     LimitReached += delegate
                     {

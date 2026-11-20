@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -12,12 +12,10 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Storage;
-using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.MTD
 {
-    [Icon("sd")]
     public sealed class CFIFlash : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize, IDisposable
     {
         public CFIFlash(string fileName, int? size = null, SysbusAccessWidth bits = SysbusAccessWidth.DoubleWord, bool nonPersistent = false)
@@ -258,7 +256,7 @@ namespace Antmicro.Renode.Peripherals.MTD
             if(nonPersistent)
             {
                 var tempFile = TemporaryFilesManager.Instance.GetTemporaryFile();
-                FileCopier.Copy(fileName, tempFile, true);
+                File.Copy(fileName, tempFile, true);
                 fileName = tempFile;
             }
             // if `requestedSize` is `null`, the file lenght will be used

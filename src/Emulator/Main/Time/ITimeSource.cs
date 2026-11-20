@@ -1,9 +1,11 @@
 //
-// Copyright (c) 2010-2018 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
+
 namespace Antmicro.Renode.Time
 {
     /// <summary>
@@ -37,6 +39,11 @@ namespace Antmicro.Renode.Time
         TimeInterval ElapsedVirtualTime { get; }
 
         /// <summary>
+        /// Used to request a pause on sinks before trying to acquire their locks.
+        /// </summary>
+        event Action StopRequested;
+
+        /// <summary>
         /// Registers a new time sink in this source.
         /// </summary>
         /// <remarks>
@@ -52,9 +59,10 @@ namespace Antmicro.Renode.Time
         /// <summary>
         /// Used by a time sink to inform that it has processed some part of the granted time.
         /// </summary>
+        /// <param name="previousElapsedTicks">Number of previously reported elapsed virtual time ticks</param>
         /// <remark>
         /// Calling this method does not mean that the granted time is fully processed. It is just used to update Elapsed Virtual Time more often than Quantum in order to handle timers well.
         /// </remark>
-        void ReportTimeProgress();
+        void ReportTimeProgress(ulong previousElapsedTicks = 0);
     }
 }

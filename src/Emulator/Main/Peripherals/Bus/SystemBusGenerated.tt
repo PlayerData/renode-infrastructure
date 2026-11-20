@@ -72,8 +72,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
                     warning = EnterTag(warning, foundTag);
-                    warning = DecorateWithCPUNameAndPC(warning);
-                    this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    if(!foundTag.Silent)
+                    {
+                        warning = DecorateWithCPUNameAndPC(warning);
+                        this.Log(LogLevel.Warning, warning.TrimEnd('.') + ", returning 0x{2}.", address, accessWidth, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2));
+                    }
                     return (<#= type #>)foundTag.DefaultValue;
                 }
 
@@ -83,7 +86,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
-                    this.Log(LogLevel.Warning, "Tried to read a locked peripheral: {0}. Address 0x{1:X}.", accessMethods.Peripheral.GetName(), address);
+                    this.Log(LogLevel.Warning, "Tried to read from locked peripheral {0} at 0x{1:X}, returning 0", accessMethods.Peripheral.GetName(), address);
                     return 0;
                 }
                 lock(accessMethods.Lock)
@@ -136,8 +139,11 @@ namespace Antmicro.Renode.Peripherals.Bus
                 if(tag is TagEntry foundTag && foundTag.OverridePeripheralAccesses)
                 {
                     warning = EnterTag(warning, foundTag);
-                    warning = DecorateWithCPUNameAndPC(warning);
-                    this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    if(!foundTag.Silent)
+                    {
+                        warning = DecorateWithCPUNameAndPC(warning);
+                        this.Log(LogLevel.Warning, warning, address, foundTag.DefaultValue.ToString("X16").Substring(16 - (int)accessWidth * 2), accessWidth);
+                    }
                     return;
                 }
 
@@ -148,7 +154,8 @@ namespace Antmicro.Renode.Peripherals.Bus
                 }
                 if(!IsPeripheralEnabled(accessMethods.Peripheral))
                 {
-                    this.Log(LogLevel.Warning, "Tried to write a locked peripheral: {0}. Address 0x{1:X}, value 0x{2:X}", accessMethods.Peripheral.GetName(), address, value);
+                    this.Log(LogLevel.Warning, "Tried to write {0} bytes (0x{1:X}) to locked peripheral at 0x{2:X}, write ignored",
+                        (uint)accessWidth, value, address);
                     return;
                 }
 
@@ -217,7 +224,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                         }
                         if(hook != null)
                         {
-                            pam.<#=operation#><#=name#> = new BusAccess.<#=name#><#=operation#>Method(new <#=operation#>HookWrapper<<#=type#>>(peripheral, new <#=actionOrFunc#><long, <#=type#>>(pam.<#=operation#><#=name#>), (Func<<#=type#>, long, <#=type#>>)(object)hook, subrange).<#=operation#>);
+                            pam.<#=operation#><#=name#> = new BusAccess.<#=name#><#=operation#>Method(new <#=operation#>HookWrapper<<#=type#>>(pam, new <#=actionOrFunc#><long, <#=type#>>(pam.<#=operation#><#=name#>), (Func<<#=type#>, long, <#=type#>>)(object)hook, subrange).<#=operation#>);
                         }
                         return pam;
                     });

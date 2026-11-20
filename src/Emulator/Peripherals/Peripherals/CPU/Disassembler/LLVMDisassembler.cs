@@ -22,14 +22,9 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 {
     public class LLVMDisassembler
     {
-        public static void ValidateTriple(ICPUSupportingLLVMDisas cpu, ref string triple)
+        public static void ValidateTriple(ICPUSupportingLLVMDisas cpu, string triple)
         {
-            if(triple == null)
-            {
-                triple = cpu.AllLLVMTriples[0];
-                return;
-            }
-            if(Array.IndexOf(cpu.AllLLVMTriples, triple) == -1)
+            if(triple == null || Array.IndexOf(cpu.AllLLVMTriples, triple) == -1)
             {
                 throw new RecoverableException($"Invalid triple {triple} for CPU. Supported triples are: {String.Join(", ", cpu.AllLLVMTriples)}");
             }
@@ -98,7 +93,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 
         private IFlaglessDisassembler GetDisassembler(string triple, bool alternateDialect)
         {
-            ValidateTriple(cpu, ref triple);
+            ValidateTriple(cpu, triple);
             var model = cpu.LLVMModel;
 
             var key = $"{triple} {model} {alternateDialect} {cpu.DisassemblyHexFormatting}";
@@ -141,16 +136,19 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
             {
                 try
                 {
-                    context = llvm_create_disasm_cpu_with_flags(triple, cpu, alternateDialect ? 1 : 0u);
+                    if(LLVMDisasBindings.LlvmCreateDisasmCpuWithFlags == null)
+                    {
+                        Logger.Warning("Old version of libllvm-disas is in use, unable to specify disassembly flags");
+                        context = LLVMDisasBindings.LlvmCreateDisasmCpu(triple, cpu);
+                    }
+                    else
+                    {
+                        context = LLVMDisasBindings.LlvmCreateDisasmCpuWithFlags(triple, cpu, alternateDialect ? 1 : 0u);
+                    }
                 }
-                catch(DllNotFoundException)
+                catch(ConstructionException)
                 {
                     throw new RecoverableException("Could not find libllvm-disas. Please check in current output directory.");
-                }
-                catch(EntryPointNotFoundException)
-                {
-                    context = llvm_create_disasm_cpu(triple, cpu);
-                    Logger.Warning("Old version of libllvm-disas is in use, unable to specify disassembly flags");
                 }
                 if(context == IntPtr.Zero)
                 {
@@ -165,7 +163,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
             {
                 if(context != IntPtr.Zero)
                 {
-                    llvm_disasm_dispose(context);
+                    LLVMDisasBindings.LlvmDisasmDispose(context);
                 }
             }
 
@@ -176,7 +174,7 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
 
                 Marshal.Copy(data, memoryOffset, marshalledData, data.Length - memoryOffset);
 
-                var bytes = llvm_disasm_instruction(context, marshalledData, (ulong)(data.Length - memoryOffset), strBuf, 1024);
+                var bytes = LLVMDisasBindings.LlvmDisasmInstruction(context, marshalledData, (ulong)(data.Length - memoryOffset), strBuf, 1024);
                 if(bytes == 0)
                 {
                     result = default(DisassemblyResult);
@@ -215,19 +213,6 @@ namespace Antmicro.Renode.Peripherals.CPU.Disassembler
                 Array.Copy(memory, memoryOffset, opcode, 0, result.OpcodeSize);
                 return true;
             }
-
-            [DllImport("libllvm-disas")]
-            private static extern int llvm_disasm_instruction(IntPtr dc, IntPtr bytes, UInt64 bytesSize, IntPtr outString, UInt32 outStringSize);
-
-            [DllImport("libllvm-disas")]
-            private static extern IntPtr llvm_create_disasm_cpu_with_flags(string tripleName, string cpu, uint flags);
-
-            // Fallback in case a new version of Renode is used with an old version of libllvm-disas
-            [DllImport("libllvm-disas")]
-            private static extern IntPtr llvm_create_disasm_cpu(string tripleName, string cpu);
-
-            [DllImport("libllvm-disas")]
-            private static extern void llvm_disasm_dispose(IntPtr disasm);
 
             private bool FormatHex(StringBuilder strBldr, int bytes, int position, byte[] data)
             {

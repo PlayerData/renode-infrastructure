@@ -7,13 +7,12 @@
 //
 
 using System;
-
-using Antmicro.Renode.UserInterface;
+using System.Numerics;
 
 namespace Antmicro.Renode.Peripherals.UART
 {
-    [Icon("monitor")]
     public interface IUART<T> : IPeripheral
+        where T : IBinaryInteger<T>
     {
         // This field should be made [Transient] in all implementor classes!
         event Action<T> CharReceived;

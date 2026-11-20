@@ -1,9 +1,11 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+
+using System;
 
 using Antmicro.Migrant;
 using Antmicro.Renode.Core;
@@ -26,6 +28,23 @@ namespace Antmicro.Renode.Peripherals.CPU
                 {
                     return;
                 }
+
+                // Leave the paused state, but don't unpause cpu yet as it still might be halted.
+                if(isPausedRequested)
+                {
+                    isPausedRequested = false;
+                    UpdateHaltedState(ignoreExecutionMode: false, fromPausedState: true);
+                }
+                else
+                {
+                    UpdateHaltedState(ignoreExecutionMode: false, fromPausedState: false);
+                }
+
+                if(HasAnyHaltingCondition)
+                {
+                    return;
+                }
+
                 started = true;
                 isPaused = false;
                 OnResume();
@@ -35,7 +54,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void Pause()
         {
-            if(isAborted || isPaused)
+            if(isAborted || isPausedRequested)
             {
                 // cpu is already paused or aborted
                 return;
@@ -48,6 +67,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public virtual bool IsHalted { get; set; }
+
+        public virtual bool HasAnyHaltingCondition => IsHalted;
 
         /// <summary>
         /// An ID that can identify a CPU in a multicore environment. Its specific interpretation will depend on CPU architecture.
@@ -65,12 +86,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             MultiprocessingId = cpuId;
         }
 
-        protected void Abort()
-        {
-            isAborted = true;
-            this.Log(LogLevel.Error, "CPU aborted");
-        }
-
         protected virtual void OnResume()
         {
             // by default do nothing
@@ -81,11 +96,21 @@ namespace Antmicro.Renode.Peripherals.CPU
             // by default do nothing
         }
 
+        protected virtual bool UpdateHaltedState(bool ignoreExecutionMode, bool fromPausedState)
+        {
+            throw new NotImplementedException();
+        }
+
         [Transient]
         protected volatile bool started;
 
         protected volatile bool isAborted;
         protected volatile bool isPaused;
+
+        /// <summary>
+        /// Set by Pause and cleared when leaving the requested pause, even if the CPU remains halted.
+        /// </summary>
+        protected volatile bool isPausedRequested;
 
         protected readonly object pauseLock = new object();
         protected readonly object haltedLock = new object();

@@ -12,9 +12,12 @@ using System.IO;
 using Antmicro.Renode.Analyzers;
 using Antmicro.Renode.Backends.Video;
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Extensions.Analyzers;
 using Antmicro.Renode.Extensions.Analyzers.Video;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Logging.Backends;
+using Antmicro.Renode.Peripherals.CAN;
+using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Peripherals.UART;
 using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
@@ -45,14 +48,12 @@ namespace Antmicro.Renode.UI
                     ConsoleBackend.Instance.PlainMode = true;
                 }
             }
-#if NET
             if(options.ServerMode)
             {
-                // This is only http endoint - 29170 is used for backward compatibility with ws proxy
-                // it does not create new socket
-                Logger.AddBackend(new WebSocketNetworkBackend("/telnet/29170", false), "network");
+                Logger.AddBackend(new WebSocketNetworkBackend("/logs", false), "network");
+                new WebSocketUartServer();
             }
-#endif
+
             Logger.AddBackend(new MemoryBackend(), "memory");
             Emulator.ShowAnalyzers = !options.HideAnalyzers;
             IDisposable ui = null;
@@ -62,14 +63,12 @@ namespace Antmicro.Renode.UI
                 File.WriteAllText(options.PidFile, pid.ToString());
             }
 
-#if NET
             if(options.UI)
             {
                 var uiProvider = new UIProvider(WebSockets.WebSocketsManager.Instance.Port);
                 uiProvider.WindowClosed += Emulator.Exit;
                 ui = uiProvider;
             }
-#endif
             else if(!options.DisableXwt || options.RobotDebug)
             {
                 ui = XwtProvider.Create(new WindowedUserInterfaceProvider());
@@ -77,10 +76,7 @@ namespace Antmicro.Renode.UI
 
             if(ui == null && options.RobotFrameworkRemoteServerPort == -1 && !options.Console && !options.ServerMode)
             {
-                if(options.Port == -1)
-                {
-                    options.Port = 1234;
-                }
+                options.Port = options.Port ?? 1234;
 
                 if(options.UI || !options.DisableXwt)
                 {
@@ -100,15 +96,17 @@ namespace Antmicro.Renode.UI
 
                 EmulationManager.Instance.ProgressMonitor.Handler = new CLIProgressMonitor();
 
-                Type uartAnalyzerType = typeof(ConsoleWindowBackendAnalyzer);
-                Type videoAnalyzerType = typeof(VideoAnalyzer);
+                var uartAnalyzerType = typeof(ConsoleWindowBackendAnalyzer);
+                var videoAnalyzerType = typeof(VideoAnalyzer);
+                var canAnalyzerType = typeof(DummyCANAnalyzer);
+                var spiAnalyzerType = typeof(DummySPIAnalyzer);
 
                 if(options.ServerMode)
                 {
-#if NET
                     uartAnalyzerType = typeof(WebSocketUartAnalyzer);
-                    videoAnalyzerType = typeof(DummyVideoAnalyzer);
-#endif
+                    videoAnalyzerType = typeof(WebSocketVideoAnalyzer);
+                    canAnalyzerType = typeof(WebSocketCANAnalyzer);
+                    spiAnalyzerType = typeof(WebSocketSPIAnalyzer);
                 }
                 else if(ui == null || options.RobotDebug)
                 {
@@ -118,10 +116,14 @@ namespace Antmicro.Renode.UI
 
                 EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(UARTBackend), uartAnalyzerType);
                 EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(VideoBackend), videoAnalyzerType);
+                EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(CANBackend), canAnalyzerType);
+                EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(SPIBackend), spiAnalyzerType);
                 EmulationManager.Instance.EmulationChanged += () =>
                 {
                     EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(UARTBackend), uartAnalyzerType);
                     EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(VideoBackend), videoAnalyzerType);
+                    EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(CANBackend), canAnalyzerType);
+                    EmulationManager.Instance.CurrentEmulation.BackendManager.SetPreferredAnalyzer(typeof(SPIBackend), spiAnalyzerType);
                 };
 
                 var shell = PrepareShell(options, monitor);
@@ -131,12 +133,13 @@ namespace Antmicro.Renode.UI
                     Name = "Shell thread"
                 }.Start();
 
-                Emulator.BeforeExit += () =>
+                var cleanup = () =>
                 {
                     Emulator.DisposeAll();
                     ui?.Dispose();
                     ui = null;
                 };
+                Emulator.RegisterCleanUp(cleanup);
 
                 if(beforeRun != null)
                 {
@@ -152,6 +155,7 @@ namespace Antmicro.Renode.UI
                         Logger.AddBackend(ConsoleBackend.Instance, "console", true);
                         terminal = new ConsoleWindowBackendAnalyzer(true);
                         terminal.Show();
+                        UsingXwtUI = true;
                         shell.Terminal = new NavigableTerminalEmulator(terminal.IO, terminal.SizeSource);
                         shell.Terminal.PlainMode = options.Plain;
 
@@ -177,7 +181,9 @@ namespace Antmicro.Renode.UI
             }
         }
 
-        private static void PrepareIOProvider(Options options, out IOProvider io, out ISizeSource size)
+        public static bool UsingXwtUI { get; private set; } = false;
+
+        private static void PrepareIOProvider(Options options, out IOProvider io, out ISizeSource size, Action onQuit)
         {
             IIOSource ioSource;
 
@@ -189,20 +195,18 @@ namespace Antmicro.Renode.UI
             }
             else if(options.Port >= 0)
             {
-                var socket = new SocketIOSource(options.Port);
+                var socket = new SocketIOSource(options.Port.Value);
                 ioSource = socket;
                 size = socket;
 
-                Logger.Log(LogLevel.Info, "Monitor available in telnet mode on port {0}", options.Port);
+                Logger.Log(LogLevel.Info, "Monitor available in telnet mode on port {0}", socket.Port.Value);
             }
-#if NET
             else if(options.ServerMode)
             {
-                ioSource = new WebSocketIOSource("/telnet/29169");
-                // TODO: Report terminal size via main WS connection?
-                size = null;
+                var socket = new WebSocketIOSource("/monitor");
+                ioSource = socket;
+                size = socket;
             }
-#endif
             else if(options.HideMonitor)
             {
                 ioSource = new DummyIOSource();
@@ -210,7 +214,9 @@ namespace Antmicro.Renode.UI
             }
             else
             {
+                UsingXwtUI = true;
                 var terminal = new ConsoleWindowBackendAnalyzer(true);
+                terminal.Quitted += onQuit;
                 terminal.Show();
                 io = terminal.IO;
                 size = terminal.SizeSource;
@@ -221,7 +227,7 @@ namespace Antmicro.Renode.UI
 
         private static Shell PrepareShell(Options options, Monitor monitor)
         {
-            PrepareIOProvider(options, out var io, out var size);
+            PrepareIOProvider(options, out var io, out var size, Emulator.Exit);
 
             var shell = ShellProvider.GenerateShell(monitor);
             shell.Terminal = new NavigableTerminalEmulator(io, size);

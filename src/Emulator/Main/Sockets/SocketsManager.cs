@@ -57,7 +57,7 @@ namespace Antmicro.Renode.Sockets
 
         public bool TryDropSocket(Socket socket)
         {
-            SocketInstance socketInstance = sockets.Where(x => x.Socket == socket).FirstOrDefault();
+            var socketInstance = sockets.Where(x => x.Socket == socket).FirstOrDefault();
             if(socketInstance != null)
             {
                 sockets.Remove(socketInstance);
@@ -90,14 +90,12 @@ namespace Antmicro.Renode.Sockets
                 {
                     if(asClient)
                     {
-#if NET
                         if(clientBind)
                         {
                             var sockPath = TemporaryFilesManager.Instance.GetUnusedFilePath(".sock");
                             Socket.Bind(new UnixDomainSocketEndPoint(sockPath));
                             AppDomain.CurrentDomain.ProcessExit += (_, __) => File.Delete(sockPath);
                         }
-#endif
                         Socket.Connect(endpoint);
                     }
                     else

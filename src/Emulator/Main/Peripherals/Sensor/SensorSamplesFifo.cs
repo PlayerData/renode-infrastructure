@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2022 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -235,6 +235,14 @@ namespace Antmicro.Renode.Peripherals.Sensors
                 }
             }
 
+            public void Restart()
+            {
+                foreach(var t in threads)
+                {
+                    t.Restart();
+                }
+            }
+
             public uint Frequency
             {
                 // We assume, that all threads have the same frequency
@@ -244,6 +252,19 @@ namespace Antmicro.Renode.Peripherals.Sensors
                     foreach(var t in threads)
                     {
                         t.Frequency = value;
+                    }
+                }
+            }
+
+            public TimeInterval Period
+            {
+                // We assume, that all threads have the same period
+                get => threads[0].Period;
+                set
+                {
+                    foreach(var t in threads)
+                    {
+                        t.Period = value;
                     }
                 }
             }

@@ -10,9 +10,6 @@ using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core;
-#if !NET
-using Antmicro.Renode.Exceptions;
-#endif
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.I2C;
 using Antmicro.Renode.Utilities;
@@ -77,7 +74,7 @@ namespace Antmicro.Renode.Peripherals.Input
             }
         }
 
-        public byte[] Read(int count)
+        public byte[] Read(int count = 1)
         {
             return currentReturnValue.Take(count).ToArray();
         }

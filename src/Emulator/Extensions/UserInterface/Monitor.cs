@@ -14,12 +14,12 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
-using Antmicro.Renode.Sockets;
 using Antmicro.Renode.UserInterface.Commands;
 using Antmicro.Renode.UserInterface.Tokenizer;
 using Antmicro.Renode.Utilities;
@@ -33,69 +33,63 @@ namespace Antmicro.Renode.UserInterface
     {
         public Monitor()
         {
-            swallowExceptions = ConfigurationManager.Instance.Get(ConfigurationSection, "consume-exceptions-from-command", true);
-            breakOnException = ConfigurationManager.Instance.Get(ConfigurationSection, "break-script-on-exception", true);
-
-            CurrentBindingFlags = BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Public | BindingFlags.Static;
+            deviceHandlingHelpers = new DeviceHandlingHelpers(this);
             Commands = new HashSet<Command>(new CommandComparer());
             TypeManager.Instance.AutoLoadedType += InitializeAutoCommand;
 
-            this.emulationManager = EmulationManager.Instance;
-
             pythonRunner = new MonitorPythonEngine(this);
             Quitted += pythonRunner.Dispose;
-            var startingCurrentDirectory = Environment.CurrentDirectory;
-            variableCollections = new Dictionary<VariableType, Dictionary<string, Token>>
-            {
-                { VariableType.Variable, variables },
-                { VariableType.Macro, macros },
-                { VariableType.Alias, aliases },
-            };
-            SetBasePath();
-            InitCommands();
-            emulationManager.CurrentEmulation.MachineAdded += RegisterResetCommand;
-            emulationManager.CurrentEmulation.MachineRemoved += UpdateMonitorPrompt;
-            emulationManager.EmulationChanged += () =>
-            {
-                Token oldOrigin;
-                variables.TryGetValue(OriginVariable, out oldOrigin);
 
-                variables.Clear();
-                SetVariable(CurrentDirectoryVariable, new PathToken("@" + startingCurrentDirectory), variables);
-                if(oldOrigin != null)
+            var startingCurrentDirectory = Environment.CurrentDirectory;
+            var handleEmulationChange = () =>
+            {
+                monitorContextOverride.Value = null;
+
+                Token oldOrigin = null;
+                monitorContext?.Variables.TryGetValue(MonitorContext.OriginVariable, out oldOrigin);
+
+                EmulationManager.Instance.CurrentEmulation.MachineAdded += RegisterResetCommand;
+                EmulationManager.Instance.CurrentEmulation.MachineRemoved += removedMachine =>
                 {
-                    SetVariable(OriginVariable, oldOrigin, variables);
-                }
-                macros.Clear();
-                aliases.Clear();
-                Machine = null;
-                emulationManager.CurrentEmulation.MachineAdded += RegisterResetCommand;
-                monitorPath.Reset();
+                    // Note: A case where removedMachine is both the CurrentMachine and OverridingMachine
+                    // is handled by EnterMachineContext.
+                    if(removedMachine == monitorContext.CurrentMachine && !monitorContext.IsMachineOverriden)
+                    {
+                        MachineChanged?.Invoke(null);
+                    }
+                };
+                MonitorContext = new MonitorContext(startingCurrentDirectory, oldOrigin);
             };
+
+            EmulationManager.Instance.EmulationChanged += handleEmulationChange;
+            handleEmulationChange();
+
             EmulationManager.PreservableManager.RegisterPreservable(this, livesThroughEmulationChange: true);
 
-            SetVariable(CurrentDirectoryVariable, new PathToken("@" + startingCurrentDirectory), variables);
-            CurrentNumberFormat = ConfigurationManager.Instance.Get<NumberModes>(ConfigurationSection, "number-format", NumberModes.Hexadecimal);
+            SetBasePath();
+            InitCommands();
 
             JoinEmulation();
         }
 
-        public void Bind(string name, Func<object> objectServer)
-        {
-            objectDelegateMappings[name] = objectServer;
-        }
+        public void SetVariable(string name, Token value) => MonitorContext.SetVariable(name, value);
+
+        public void SetMacro(string name, Token value) => MonitorContext.SetMacro(name, value);
+
+        public void SetAlias(string name, Token value) => MonitorContext.SetAlias(name, value);
+
+        public void Bind(string name, Func<object> objectServer) =>
+            MonitorContext.Bind(name, objectServer);
 
         public bool TryLoadPlatform(string filename, ICommandInteraction writer = null)
         {
-            if(writer == null)
+            writer = writer ?? Interaction;
+
+            if(Machine == null)
             {
-                writer = Interaction;
-            }
-            if(CurrentMachine == null)
-            {
-                var machine = new Machine();
-                EmulationManager.Instance.CurrentEmulation.AddMachine(machine);
-                CurrentMachine = machine;
+                var newMachine = new Machine();
+                EmulationManager.Instance.CurrentEmulation.AddMachine(newMachine);
+                Machine = newMachine;
             }
             var path = new PathToken(filename);
             var command = new LiteralToken("LoadPlatformDescription");
@@ -103,34 +97,12 @@ namespace Antmicro.Renode.UserInterface
             return true;
         }
 
-        public bool SetPeripheralMacro(IPeripheral peripheral, string macroName, string contents, IMachine machine = null)
-        {
-            machine = machine ?? CurrentMachine;
-            string variablePrefix;
-            if(peripheral == null)
-            {
-                variablePrefix = "";
-            }
-            else if(machine.TryGetLocalName(peripheral, out variablePrefix))
-            {
-                variablePrefix += ".";
-            }
-            else
-            {
-                return false;
-            }
-
-            var variableName = GetVariableName($"{variablePrefix}{macroName}");
-            SetVariable(variableName, new StringToken(contents), macros);
-            return true;
-        }
+        public bool SetPeripheralMacro(IPeripheral peripheral, string macroName, string contents, IMachine machine = null) =>
+            MonitorContext.SetPeripheralMacro(peripheral, macroName, contents, machine);
 
         public bool Parse(string cmd, ICommandInteraction writer = null)
         {
-            if(writer == null)
-            {
-                writer = Interaction;
-            }
+            writer = writer ?? Interaction;
 
             if(stringEaterMode > 0)
             {
@@ -140,7 +112,7 @@ namespace Antmicro.Renode.UserInterface
                     stringEaterMode += 1;
                     if(stringEaterMode > 2)
                     {
-                        SetVariable(stringEaterVariableName, new StringToken(stringEaterValue), variableCollections[recordingType.Value]);
+                        MonitorContext.SetVariable(stringEaterVariableName, new StringToken(stringEaterValue), recordingType.Value);
                         stringEaterValue = "";
                         stringEaterMode = 0;
                     }
@@ -155,7 +127,8 @@ namespace Antmicro.Renode.UserInterface
                     stringEaterValue = stringEaterValue + cmd;
                     return true;
                 }
-                SetVariable(stringEaterVariableName, new StringToken(cmd), variableCollections[recordingType.Value]);
+
+                MonitorContext.SetVariable(stringEaterVariableName, new StringToken(cmd), recordingType.Value);
                 stringEaterValue = "";
                 stringEaterMode = 0;
                 return true;
@@ -163,6 +136,10 @@ namespace Antmicro.Renode.UserInterface
 
             if(string.IsNullOrWhiteSpace(cmd))
             {
+                if(RepeatLastCommand && TokensOfLastExecutedCommand != null)
+                {
+                    return ExecuteCommand(TokensOfLastExecutedCommand, writer);
+                }
                 return true;
             }
             var tokens = Tokenize(cmd, writer);
@@ -189,7 +166,7 @@ namespace Antmicro.Renode.UserInterface
             var tokens = tokensToParse.ToList();
             foreach(var token in tokens)
             {
-                Token resultToken = token;
+                var resultToken = token;
                 if(token is CommentToken)
                 {
                     continue;
@@ -207,39 +184,14 @@ namespace Antmicro.Renode.UserInterface
                 var pathToken = token as PathToken;
                 if(pathToken != null)
                 {
-                    string fileName;
-                    if(TryGetFilenameFromAvailablePaths(pathToken.Value, out fileName))
+                    if(PathHelpers.TryGetFilenameFromAvailablePaths(pathToken.Path, MonitorContext.MonitorPath.PathElements, out var fileName))
                     {
                         resultToken = new PathToken("@" + fileName);
                     }
                     else
                     {
-                        Uri uri;
-                        string filename;
-                        string fname = pathToken.Value;
-                        try
-                        {
-                            uri = new Uri(fname);
-                            if(uri.IsFile)
-                            {
-                                throw new UriFormatException();
-                            }
-                            var success = Emulation.FileFetcher.TryFetchFromUri(uri, out filename);
-                            if(!success)
-                            {
-                                writer.WriteError("Failed to download {0}, see log for details.".FormatWith(fname));
-                                filename = null;
-                                if(breakOnException)
-                                {
-                                    return false;
-                                }
-                            }
-                            resultToken = new PathToken("@" + filename);
-                        }
-                        catch(UriFormatException)
-                        {
-                            //Not a proper uri, so probably a nonexisting local path
-                        }
+                        pathToken.Update(EmulationManager.Instance.CurrentEmulation.FileFetcher);
+                        resultToken = pathToken;
                     }
                 }
 
@@ -260,67 +212,33 @@ namespace Antmicro.Renode.UserInterface
                     return false;
                 }
             }
-            catch(Exception e)
+            catch(Exception e) when(swallowExceptions && e.IsExceptionRecoverable(allowAggregate: true))
             {
-                var ex = e as AggregateException;
-                if(ex != null)
+                var contextMessage = String.Join(" ", result.Select(x => x.OriginalValue));
+
+                foreach(var ex in (IEnumerable<Exception>)(e as AggregateException)?.InnerExceptions ?? new[] { e })
                 {
-                    if(ex.InnerExceptions.Any(x => !(x is RecoverableException)))
-                    {
-                        throw;
-                    }
+                    PrintException(contextMessage, ex, writer);
                 }
-                else if(!(e is RecoverableException))
-                {
-                    throw;
-                }
-                if(swallowExceptions)
-                {
-                    if(ex != null)
-                    {
-                        foreach(var inner in ex.InnerExceptions)
-                        {
-                            PrintException(String.Join(" ", result.Select(x => x.OriginalValue)), inner, writer);
-                        }
-                    }
-                    else
-                    {
-                        PrintException(String.Join(" ", result.Select(x => x.OriginalValue)), e, writer);
-                    }
-                    if(breakOnException)
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    throw;
-                }
+
+                return !breakOnException;
             }
             return true;
         }
 
-        public void SetVariable(string var, Token val, Dictionary<string, Token> collection)
+        public bool TryExecuteScript(string filename, ICommandInteraction writer = null, IMachine machine = null)
         {
-            collection[var] = val;
-        }
-
-        public bool TryExecuteScript(string filename, ICommandInteraction writer = null)
-        {
-            if(writer == null)
-            {
-                writer = Interaction;
-            }
+            writer = writer ?? Interaction;
 
             Token oldOrigin;
             var originalFilename = filename;
-            if(!TryGetFilenameFromAvailablePaths(filename, out filename))
+            if(!PathHelpers.TryGetFilenameFromAvailablePaths(filename, MonitorContext.MonitorPath.PathElements, out filename))
             {
                 writer.WriteError($"Could not find file '{originalFilename}'");
                 return false;
             }
-            variables.TryGetValue(OriginVariable, out oldOrigin);
-            SetVariable(OriginVariable, new PathToken("@" + Path.GetDirectoryName(filename).Replace(" ", @"\ ")), variables);
+            MonitorContext.Variables.TryGetValue(MonitorContext.OriginVariable, out oldOrigin);
+            SetVariable(MonitorContext.OriginVariable, new PathToken("@" + Path.GetDirectoryName(filename).Replace(" ", @"\ ")));
             var lines = File.ReadAllLines(filename);
             Array.ForEach(lines, x => x.Replace("\r", "\n"));
             var processedLines = new List<string>(lines.Length);
@@ -357,17 +275,34 @@ namespace Antmicro.Renode.UserInterface
             }
 
             var success = true;
-            foreach(var ln in processedLines)
+
+            var parseFile = () =>
             {
-                if(!Parse(ln))
+                foreach(var ln in processedLines)
                 {
-                    success = false;
-                    break;
+                    if(!Parse(ln))
+                    {
+                        success = false;
+                        break;
+                    }
+                }
+            };
+
+            if(machine != null)
+            {
+                using(EnterMachineContext(machine))
+                {
+                    parseFile();
                 }
             }
+            else
+            {
+                parseFile();
+            }
+
             if(oldOrigin != null)
             {
-                SetVariable(OriginVariable, oldOrigin, variables);
+                SetVariable(MonitorContext.OriginVariable, oldOrigin);
             }
             return success;
         }
@@ -377,10 +312,8 @@ namespace Antmicro.Renode.UserInterface
             return pythonRunner.ExecutePythonCommand(command, Interaction);
         }
 
-        public object GetVariable(string name)
-        {
-            return TryExpandVariable(new VariableToken(name), variables, out var value) ? value.GetObjectValue() : null;
-        }
+        public object GetVariable(string name) =>
+            MonitorContext.GetVariable(name);
 
         public void UnregisterCommand(Command command)
         {
@@ -394,10 +327,7 @@ namespace Antmicro.Renode.UserInterface
 
         public bool TryCompilePlugin(string[] filenames, ICommandInteraction writer = null)
         {
-            if(writer == null)
-            {
-                writer = Interaction;
-            }
+            writer = writer ?? Interaction;
 
             // Sort filenames to have consistent order when calculating hash
             Array.Sort(filenames);
@@ -437,8 +367,7 @@ namespace Antmicro.Renode.UserInterface
                     // Load dynamically compiled assembly to memory. It presents an advantage that next
                     // ad-hoc compiled assembly can reference types from this one without any extra steps.
                     // Therefore "EnsureTypeIsLoaded" call is no necessary as dependencies are already loaded.
-                    // Assembly.LoadFrom is used for a compatibility with Mono/.NET Framework,
-                    // but once we move fully to .NET, consider AssemblyLoadContext.LoadFromAssemblyPath.
+                    // XXX: Consider AssemblyLoadContext.LoadFromAssemblyPath.
                     Assembly.LoadFrom(compiledCode);
                     EmulationManager.Instance.CompiledFilesCache.StoreEntryWithSha(sha, compiledCode);
                 }
@@ -460,18 +389,8 @@ namespace Antmicro.Renode.UserInterface
             }
         }
 
-        public void BindStatic(string name, Func<object> objectServer)
-        {
-            staticObjectDelegateMappings[name] = objectServer;
-        }
-
-        public void OnMachineRemoved(Machine m)
-        {
-            if(m == CurrentMachine)
-            {
-                CurrentMachine = null;
-            }
-        }
+        public void BindStatic(string name, Func<object> objectServer) =>
+            MonitorContext.BindStatic(name, objectServer);
 
         public void RegisterCommand(Command command)
         {
@@ -511,7 +430,7 @@ namespace Antmicro.Renode.UserInterface
                 throw new RecoverableException("Unexpected state received while loading preserved state");
             }
 
-            if(!emulationManager.CurrentEmulation.TryGetMachineByName(machineName, out var newMachine))
+            if(!EmulationManager.Instance.CurrentEmulation.TryGetMachineByName(machineName, out var newMachine))
             {
                 throw new RecoverableException("Machine was not found in the snapshot");
             }
@@ -519,50 +438,77 @@ namespace Antmicro.Renode.UserInterface
             Machine = newMachine;
         }
 
-        public IDisposable PushDirectory(string directory)
+        public IDisposable PushDirectory(string directory) =>
+            MonitorContext.PushDirectory(directory);
+
+        public IDisposable EnterContext(MonitorContext newContext)
         {
-            monitorPath.PushDirectory(directory);
-            return DisposableWrapper.New(() => monitorPath.PopDirectory());
+            var oldContext = monitorContextOverride.Value;
+            monitorContextOverride.Value = newContext;
+            return DisposableWrapper.New(() => monitorContextOverride.Value = oldContext);
         }
 
-        public IEnumerable<Command> RegisteredCommands
+        public bool IsContextOverriden
         {
-            get
-            {
-                return Commands;
-            }
+            get => !(monitorContextOverride.Value is null);
         }
+
+        public IEnumerable<Command> RegisteredCommands => Commands;
 
         public ICommandInteraction Interaction { get; set; }
 
-        public IEnumerable<string> CurrentPathPrefixes
-        {
-            get
-            {
-                return monitorPath.PathElements;
-            }
-        }
+        public IEnumerable<string> CurrentPathPrefixes => MonitorContext.MonitorPath.PathElements;
 
         public Func<IEnumerable<ICommandDescription>> GetInternalCommands { get; set; }
 
         public IMachine Machine
         {
-            get
-            {
-                return CurrentMachine;
-            }
+            get => MonitorContext.CurrentMachine;
 
             set
             {
-                CurrentMachine = value;
+                var changingOriginalMachine = monitorContextOverride.Value == null && !MonitorContext.IsMachineOverriden;
+                var previousMachine = monitorContext.CurrentMachine;
+
+                MonitorContext.CurrentMachine = value;
+                if(changingOriginalMachine && previousMachine != value)
+                {
+                    MachineChanged?.Invoke(MonitorContext.MachineName);
+                }
             }
         }
 
+        public MonitorContext MonitorContext
+        {
+            get => monitorContextOverride.Value ?? monitorContext;
+            set
+            {
+                if(monitorContextOverride.Value != null)
+                {
+                    monitorContextOverride.Value = value;
+                }
+                else
+                {
+                    if(monitorContext?.CurrentMachine != value.CurrentMachine)
+                    {
+                        MachineChanged?.Invoke(value.MachineName);
+                    }
+                    monitorContext = value;
+                }
+            }
+        }
+
+        public DeviceHandlingHelpers DeviceHelpers => deviceHandlingHelpers;
+
         public string PreservableName => "Monitor";
+
+        public bool RepeatLastCommand { get; set; }
+            = ConfigurationManager.Instance.Get<bool>(Monitor.ConfigurationSection, "repeat-last-by-default", false);
 
         public event Action<string> MachineChanged;
 
         public const string StartupCommandEnv = "STARTUP_COMMAND";
+        public const string ConfigurationSection = "monitor";
 
         private static void SetBasePath()
         {
@@ -572,41 +518,6 @@ namespace Antmicro.Renode.UserInterface
                 return;
             }
             Directory.SetCurrentDirectory(baseDirectory);
-        }
-
-        private static string StripPrefix(string path, string prefix)
-        {
-            if(String.IsNullOrEmpty(prefix))
-            {
-                return path;
-            }
-            return path.StartsWith(prefix, StringComparison.Ordinal) ? path.Substring(prefix.Length + (prefix.EndsWith(Path.DirectorySeparatorChar) ? 0 : 1)) : path;
-        }
-
-        private static String AllButLastAndAggregate(IEnumerable<String> value, bool dontDropLast = false)
-        {
-            if(dontDropLast)
-            {
-                return value.Any() ? value.Aggregate((x, y) => x + ' ' + y) : string.Empty;
-            }
-            var list = value.ToList();
-            if(list.Count < 2)
-            {
-                return String.Empty;
-            }
-            var output = AllButLast(value);
-            return output.Aggregate((x, y) => x + ' ' + y);
-        }
-
-        private static IEnumerable<T> AllButLast<T>(IEnumerable<T> value) where T : class
-        {
-            var list = value.ToList();
-            if(list.Any())
-            {
-                var last = list.Last();
-                return list.Where(x => x != last);
-            }
-            return value;
         }
 
         private static string FindLastCommandInString(string origin)
@@ -642,28 +553,31 @@ namespace Antmicro.Renode.UserInterface
                     return Enumerable.Empty<string>();
                 }
                 var files = Directory.GetFiles(directoryPath, lastElement + '*', SearchOption.TopDirectoryOnly)
-                                     .Select(x => allButLast + "@" + StripPrefix(x, prefix).Replace(" ", @"\ "));
+                                     .Select(x => allButLast + "@" + PathHelpers.StripPathPrefix(x, prefix).Replace(" ", @"\ "));
                 var dirs = Directory.GetDirectories(directoryPath, lastElement + '*', SearchOption.TopDirectoryOnly)
-                                    .Select(x => allButLast + "@" + (StripPrefix(x, prefix) + '/').Replace(" ", @"\ "));
+                                    .Select(x => allButLast + "@" + (PathHelpers.StripPathPrefix(x, prefix) + '/').Replace(" ", @"\ "));
 
                 var result = new List<string>();
                 //We change "\" characters to "/", unless they were followed by the space character, in which case they treated as escape char.
                 foreach(var file in files.Concat(dirs))
                 {
-                    var sanitizedFile = SanitizePathSeparator(file);
+                    var sanitizedFile = PathHelpers.SanitizePathSeparator(file);
                     result.Add(sanitizedFile);
                 }
                 return result;
             }
             catch(UnauthorizedAccessException)
             {
-                return new[] { "{0}@{1}/".FormatWith(allButLast, Path.Combine(StripPrefix(directoryPath, prefix), lastElement)) };
+                return new[] { "{0}@{1}/".FormatWith(allButLast, Path.Combine(PathHelpers.StripPathPrefix(directoryPath, prefix), lastElement)) };
             }
         }
 
+        private static readonly bool swallowExceptions = ConfigurationManager.Instance.Get(ConfigurationSection, "consume-exceptions-from-command", true);
+        private static readonly bool breakOnException = ConfigurationManager.Instance.Get(ConfigurationSection, "break-script-on-exception", true);
+
         private bool ExecuteCommand(Token[] com, ICommandInteraction writer)
         {
-            if(verboseMode)
+            if(MonitorContext.VerboseMode)
             {
                 writer.WriteLine("Executing: " + com.Select(x => x.OriginalValue).Aggregate((x, y) => x + " " + y));
             }
@@ -677,12 +591,13 @@ namespace Antmicro.Renode.UserInterface
             {
                 Token dummy;
                 var variableToExpand = com[0] as VariableToken;
-                if(com[1] is ConditionalEqualityToken && TryExpandVariable(variableToExpand, variables, out dummy))
+                if(com[1] is ConditionalEqualityToken && MonitorContext.TryExpandVariable(variableToExpand, MonitorContext.Variables, out dummy))
                 {
                     //variable exists, so we ignore this command
                     return true;
                 }
                 (Commands.OfType<SetCommand>().First()).Run(writer, variableToExpand, com[2]);
+                SaveTokens(com);
                 return true;
             }
             var command = com[0] as LiteralToken;
@@ -696,11 +611,13 @@ namespace Antmicro.Renode.UserInterface
             var commandHandler = Commands.FirstOrDefault(x => x.Name == command.Value);
             if(commandHandler != null)
             {
-                return RunCommand(writer, commandHandler, com.Skip(1).ToList());
+                var result = RunCommand(writer, commandHandler, com.Skip(1).ToList());
+                SaveTokensIfOk(com, result);
+                return result;
             }
-            else if(IsNameAvailable(command.Value))
+            else if(MonitorContext.IsNameAvailable(command.Value))
             {
-                ProcessDeviceActionByName(command.Value, ExpandVariables(com.Skip(1)), writer);
+                ProcessDeviceActionByName(command.Value, MonitorContext.ExpandVariables(com.Skip(1)), writer);
             }
             else if(IsNameAvailableInEmulationManager(command.Value))
             {
@@ -712,113 +629,34 @@ namespace Antmicro.Renode.UserInterface
                 {
                     if(item.AlternativeNames != null && item.AlternativeNames.Contains(command.Value))
                     {
-                        return RunCommand(writer, item, com.Skip(1).ToList());
+                        var result = RunCommand(writer, item, com.Skip(1).ToList());
+                        SaveTokensIfOk(com, result);
+                        return result;
                     }
                 }
 
-                if(TryExpandVariable(new VariableToken(string.Format("${0}", com[0].OriginalValue)), aliases, out var cmd))
+                if(MonitorContext.TryExpandVariable(new VariableToken(string.Format("${0}", com[0].OriginalValue)), MonitorContext.Aliases, out var cmd))
                 {
                     var aliasedCommand = Tokenize(cmd.GetObjectValue().ToString(), writer).Tokens;
-                    return ParseTokens(aliasedCommand.Concat(com.Skip(1)), writer);
+                    var result = ParseTokens(aliasedCommand.Concat(com.Skip(1)), writer);
+                    SaveTokensIfOk(com, result);
+                    return result;
                 }
 
-                if(!pythonRunner.ExecuteBuiltinCommand(ExpandVariables(com).ToArray(), writer))
+                if(!pythonRunner.ExecuteBuiltinCommand(MonitorContext.ExpandVariables(com).ToArray(), writer))
                 {
                     writer.WriteError(string.Format("No such command or device: {0}", com[0].GetObjectValue()));
                     return false;
                 }
             }
+            SaveTokens(com);
             return true;
-        }
-
-        private bool IsNameAvailable(string name)
-        {
-            var names = GetAvailableNames();
-            var ret = names.Contains(name);
-            if(!ret)
-            {
-                foreach(var use in usings)
-                {
-                    ret = names.Contains(use + name);
-                    if(ret)
-                    {
-                        break;
-                    }
-                }
-            }
-            return ret;
-        }
-
-        private IEnumerable<string> GetAvailableNames()
-        {
-            if(CurrentMachine != null)
-            {
-                return CurrentMachine.GetAllNames().Union(Emulation.ExternalsManager.GetNames().Union(staticObjectDelegateMappings.Keys.Union(objectDelegateMappings.Keys)));
-            }
-            return Emulation.ExternalsManager.GetNames().Union(staticObjectDelegateMappings.Keys);
-        }
-
-        private IEnumerable<string> GetAllAvailableNames()
-        {
-            var baseNames = GetAvailableNames().ToList();
-            var result = new List<string>(baseNames);
-            foreach(var use in usings)
-            {
-                var localUse = use;
-                result.AddRange(baseNames.Where(x => x.StartsWith(localUse, StringComparison.Ordinal) && x.Length > localUse.Length).Select(x => x.Substring(localUse.Length)));
-            }
-            return result;
-        }
-
-        private bool TryExpandVariable(VariableToken token, Dictionary<string, Token> collection, out Token expandedVariable)
-        {
-            expandedVariable = null;
-            var varName = token.Value;
-            string newName;
-            if(collection.TryGetValue(varName, out expandedVariable))
-            {
-                return true;
-            }
-            if(CurrentMachine != null)
-            {
-                newName = String.Format("{0}.{1}", Emulation[CurrentMachine].Replace("-", "_"), varName);
-                if(collection.TryGetValue(newName, out expandedVariable))
-                {
-                    return true;
-                }
-            }
-            newName = String.Format("{0}{1}", GlobalVariablePrefix, varName);
-            if(collection.TryGetValue(newName, out expandedVariable))
-            {
-                return true;
-            }
-            return false;
         }
 
         private bool IsNameAvailableInEmulationManager(string name)
         {
             var info = GetMonitorInfo(typeof(EmulationManager));
             return info.AllNames.Contains(name);
-        }
-
-        private object FromStaticMapping(string name)
-        {
-            Func<object> value;
-            if(staticObjectDelegateMappings.TryGetValue(name, out value))
-            {
-                return value();
-            }
-            return null;
-        }
-
-        private object FromMapping(string name)
-        {
-            Func<object> value;
-            if(objectDelegateMappings.TryGetValue(name, out value))
-            {
-                return value();
-            }
-            return null;
         }
 
         private IEnumerable<String> SuggestCommands(String prefix)
@@ -833,16 +671,20 @@ namespace Antmicro.Renode.UserInterface
             {
                 lastElement = prefixSplit.Last();
             }
-            var allButLastOptional = AllButLastAndAggregate(prefixSplit, prefix.EndsWith(' '));
+
+            var optionalInput = prefix.EndsWith(' ') ? prefixSplit : prefixSplit.SkipLast(1);
+            var allButLastOptional = string.Join(' ', optionalInput);
             if(!string.IsNullOrEmpty(allButLastOptional))
             {
                 allButLastOptional += ' ';
             }
-            var allButLast = AllButLastAndAggregate(prefixSplit);
+
+            var allButLast = string.Join(' ', prefixSplit.SkipLast(1));
             if(!string.IsNullOrEmpty(allButLast))
             {
                 allButLast += ' ';
             }
+
             //paths
             if(lastElement.StartsWith('@'))
             {
@@ -867,31 +709,20 @@ namespace Antmicro.Renode.UserInterface
                 }
                 else
                 {
-                    foreach(var pathEntry in monitorPath.PathElements.Select(x => Path.GetFullPath(x)))
+                    foreach(var pathEntry in MonitorContext.MonitorPath.PathElements.Select(x => Path.GetFullPath(x)))
                     {
                         if(!Directory.Exists(pathEntry))
                         {
                             continue;
                         }
-                        try
-                        {
-                            suggestions.AddRange(SuggestFiles(allButLast, pathEntry, directory, file));
-                        }
-                        catch(Exception)
-                        {
-                            Logger.LogAs(this, LogLevel.Debug, "Bug in mono on Directory.GetFiles!");
-                        }
+                        suggestions.AddRange(SuggestFiles(allButLast, pathEntry, directory, file));
                     }
                 }
             }
             //variables
             else if(lastElement.StartsWith('$'))
             {
-                var varName = lastElement.Substring(1);
-                var options = variables.Keys.Concat(macros.Keys).Where(x => x.StartsWith(varName, StringComparison.Ordinal)).ToList();
-                var machinePrefix = CurrentMachine == null ? GlobalVariablePrefix : Emulation[CurrentMachine] + ".";
-                options.AddRange(variables.Keys.Concat(macros.Keys).Where(x => x.StartsWith(String.Format("{0}{1}", machinePrefix, varName), StringComparison.Ordinal)).Select(x => x.Substring(machinePrefix.Length)));
-
+                var options = MonitorContext.FindMatchingVariables(lastElement);
                 if(options.Any())
                 {
                     suggestions.AddRange(options.Select(x => allButLast + '$' + x));
@@ -907,9 +738,9 @@ namespace Antmicro.Renode.UserInterface
                     var sugs = cmd.ProvideSuggestions(currentCommandSplit.Length > 1 ? currentCommandSplit[1] : string.Empty);
                     suggestions.AddRange(sugs.Select(s => string.Format("{0}{1}", allButLastOptional, s)));
                 }
-                else if(currentCommandSplit.Length > 1 && GetAllAvailableNames().Contains(currentCommandSplit[0]))
+                else if(currentCommandSplit.Length > 1 && MonitorContext.GetAllAvailableNames().Contains(currentCommandSplit[0]))
                 {
-                    var currentObject = GetDevice(currentCommandSplit[0]);
+                    var currentObject = MonitorContext.GetDevice(currentCommandSplit[0]);
                     //Take whole command split without first and last element
                     var commandsChain = currentCommandSplit.Skip(1).Take(currentCommandSplit.Length - 2).Select((word, index) => new { word, index }).ToList();
                     foreach(var command in commandsChain)
@@ -943,15 +774,15 @@ namespace Antmicro.Renode.UserInterface
             {
                 var sugg = Commands.Select(x => x.Name).ToList();
 
-                sugg.AddRange(GetAllAvailableNames());
+                sugg.AddRange(MonitorContext.GetAllAvailableNames());
                 sugg.AddRange(pythonRunner.GetPythonCommands());
-                sugg.AddRange(aliases.Keys);
-                sugg.AddRange(aliases.Keys.Select(x => x.Substring(x.IndexOf('.') + 1))); // remove the "global." or "{machine-name}." prefix
+                sugg.AddRange(MonitorContext.Aliases.Keys);
+                sugg.AddRange(MonitorContext.Aliases.Keys.Select(x => x.Substring(x.IndexOf('.') + 1))); // remove the "global." or "{machine-name}." prefix
                 suggestions.AddRange(sugg.Where(x => x.StartsWith(currentCommandSplit[0])).Select(x => prefixToAdd + x));
 
                 if(suggestions.Count == 0) //EmulationManager
                 {
-                    var dev = GetDevice(typeof(EmulationManager).Name);
+                    var dev = MonitorContext.GetDevice(typeof(EmulationManager).Name);
                     var devInfo = GetObjectSuggestions(dev).Distinct();
                     if(devInfo != null)
                     {
@@ -962,35 +793,9 @@ namespace Antmicro.Renode.UserInterface
             return suggestions.OrderBy(x => x).Distinct();
         }
 
-        private Token ExpandVariable(VariableToken token, Dictionary<string, Token> collection)
-        {
-            Token result;
-            if(!TryExpandVariable(token, collection, out result))
-            {
-                throw new RecoverableException(string.Format("No such variable: ${0}", token.Value));
-            }
-            return result;
-        }
-
-        private bool TryGetFilenameFromAvailablePaths(string fileName, out string fullPath)
-        {
-            fullPath = String.Empty;
-            //Try to find the given file, then the file with path prefix
-            foreach(var pathElement in monitorPath.PathElements.Prepend(String.Empty))
-            {
-                var currentPath = Path.Combine(pathElement, fileName);
-                if(File.Exists(currentPath) || Directory.Exists(currentPath))
-                {
-                    fullPath = Path.GetFullPath(currentPath);
-                    return true;
-                }
-            }
-            return false;
-        }
-
         private void PrintException(string commandName, Exception e, ICommandInteraction writer)
         {
-            writer.WriteError(string.Format("There was an error executing command '{0}'", commandName));
+            writer.WriteError(string.Format("There was an error executing command '{0}': ", commandName));
             PrintExceptionDetails(e, writer);
         }
 
@@ -1000,39 +805,19 @@ namespace Antmicro.Renode.UserInterface
             machine.PeripheralReset += ResetPeripheral;
         }
 
-        private void UpdateMonitorPrompt(IMachine machine)
-        {
-            if(CurrentMachine == machine)
-            {
-                CurrentMachine = null;
-            }
-        }
-
-        private IList<Token> ExpandVariables(IEnumerable<Token> tokens)
-        {
-            return tokens.Select(x => x is VariableToken ? ExpandVariable(x as VariableToken, variables) ?? x : x).ToList(); // ?? to prevent null tokens
-        }
-
         private void JoinEmulation()
         {
             Emulation.MachineExchanged += (oldMachine, newMachine) =>
             {
-                if(CurrentMachine == oldMachine)
+                if(Machine == oldMachine)
                 {
-                    CurrentMachine = newMachine;
+                    Machine = newMachine;
                 }
             };
         }
 
         private void InitCommands()
         {
-            Bind(Core.Machine.MachineKeyword, () => Machine);
-            BindStatic("connector", () => emulationManager.CurrentEmulation.Connector);
-            BindStatic(EmulationToken, () => Emulation);
-            BindStatic("plugins", () => TypeManager.Instance.PluginManager);
-            BindStatic("EmulationManager", () => emulationManager);
-            BindStatic("sockets", () => SocketsManager.Instance);
-
             var includeCommand = new IncludeFileCommand(this, (x, y) => pythonRunner.TryExecutePythonScript(x, y), x => TryExecuteScript(x), (x, y) => TryCompilePlugin(x, y), (x, y) => TryLoadPlatform(x, y));
             Commands.Add(new HelpCommand(this, () =>
             {
@@ -1045,24 +830,27 @@ namespace Antmicro.Renode.UserInterface
                 return result;
             }));
             Commands.Add(includeCommand);
-            Commands.Add(new CreatePlatformCommand(this, x => CurrentMachine = x));
-            Commands.Add(new UsingCommand(this, () => usings));
-            Commands.Add(new QuitCommand(this, x => CurrentMachine = x, () => Quitted));
-            Commands.Add(new PeripheralsCommand(this, () => CurrentMachine));
-            Commands.Add(new MonitorPathCommand(this, monitorPath));
+            Commands.Add(new CreatePlatformCommand(this, x => Machine = x));
+            Commands.Add(new UsingCommand(this, () => MonitorContext.Usings));
+            Commands.Add(new QuitCommand(this, x => Machine = x, () => Quitted));
+            Commands.Add(new PeripheralsCommand(this, () => Machine));
+            Commands.Add(new TagsCommand(this, () => Machine));
+            Commands.Add(new MonitorPathCommand(this, () => MonitorContext.MonitorPath));
             Commands.Add(new StartCommand(this, includeCommand));
-            Commands.Add(new SetCommand(this, "set", "VARIABLE", (x, y) => SetVariable(x, y, variables), (x, y) => EnableStringEater(x, y, VariableType.Variable),
-                DisableStringEater, () => stringEaterMode, GetVariableName));
-            Commands.Add(new SetCommand(this, "macro", "MACRO", (x, y) => SetVariable(x, y, macros), (x, y) => EnableStringEater(x, y, VariableType.Macro),
-                DisableStringEater, () => stringEaterMode, GetVariableName));
-            Commands.Add(new SetCommand(this, "alias", "ALIAS", (x, y) => SetVariable(x, y, aliases), (x, y) => EnableStringEater(x, y, VariableType.Alias),
-            DisableStringEater, () => stringEaterMode, GetVariableName));
-            Commands.Add(new PythonExecuteCommand(this, x => ExpandVariable(x, variables), (x, y) => pythonRunner.ExecutePythonCommand(x, y)));
-            Commands.Add(new ExecuteCommand(this, "execute", "VARIABLE", x => ExpandVariable(x, variables), () => variables.Keys));
-            Commands.Add(new ExecuteCommand(this, "runMacro", "MACRO", x => ExpandVariable(x, macros), () => macros.Keys));
-            Commands.Add(new MachCommand(this, () => CurrentMachine, x => CurrentMachine = x));
+            Commands.Add(new SetCommand(this, "set", "VARIABLE", (x, y) => SetVariable(x, y), (x, y) => EnableStringEater(x, y, VariableType.Variable),
+                DisableStringEater, () => stringEaterMode, name => MonitorContext.GetVariableName(name)));
+            Commands.Add(new SetCommand(this, "macro", "MACRO", (x, y) => SetMacro(x, y), (x, y) => EnableStringEater(x, y, VariableType.Macro),
+                DisableStringEater, () => stringEaterMode, name => MonitorContext.GetVariableName(name)));
+            Commands.Add(new SetCommand(this, "alias", "ALIAS", (x, y) => SetAlias(x, y), (x, y) => EnableStringEater(x, y, VariableType.Alias),
+                DisableStringEater, () => stringEaterMode, name => MonitorContext.GetVariableName(name)));
+            Commands.Add(new PythonExecuteCommand(this, x => MonitorContext.ExpandVariable(x, MonitorContext.Variables), (x, y) => pythonRunner.ExecutePythonCommand(x, y)));
+            Commands.Add(new ExecuteCommand(this, "execute", "VARIABLE", x => MonitorContext.ExpandVariable(x, MonitorContext.Variables), () => MonitorContext.Variables.Keys));
+            Commands.Add(new ExecuteCommand(this, "runMacro", "MACRO", x => MonitorContext.ExpandVariable(x, MonitorContext.Macros), () => MonitorContext.Macros.Keys));
+            Commands.Add(new MachCommand(this, () => Machine, x => Machine = x));
             Commands.Add(new ResdCommand(this));
-            Commands.Add(new VerboseCommand(this, x => verboseMode = x));
+            Commands.Add(new VerboseCommand(this, x => MonitorContext.VerboseMode = x));
+            Commands.Add(new SetAndRevertAfterCommand(this));
+            Commands.Add(new PrintEnvironmentCommand(this));
         }
 
         private void DisableStringEater()
@@ -1085,11 +873,11 @@ namespace Antmicro.Renode.UserInterface
             string machineName;
             if(EmulationManager.Instance.CurrentEmulation.TryGetMachineName(machine, out machineName))
             {
-                using(ObtainMachineContext(machine))
+                using(EnterMachineContext(machine))
                 {
-                    var macroName = GetVariableName("reset");
+                    var macroName = MonitorContext.GetVariableName("reset");
                     Token resetMacro;
-                    if(macros.TryGetValue(macroName, out resetMacro))
+                    if(MonitorContext.Macros.TryGetValue(macroName, out resetMacro))
                     {
                         var macroLines = resetMacro.GetObjectValue().ToString().Split('\n');
                         foreach(var line in macroLines)
@@ -1140,7 +928,7 @@ namespace Antmicro.Renode.UserInterface
                 //E.g. i $ORIGIN/dir/script. This happens only if the variable is the last successful token.
                 if(result.Tokens.Any() && result.Tokens.Last() is VariableToken lastVariableToken)
                 {
-                    if(!TryExpandVariable(lastVariableToken, variables, out var lastExpandedToken))
+                    if(!MonitorContext.TryExpandVariable(lastVariableToken, MonitorContext.Variables, out var lastExpandedToken))
                     {
                         writer.WriteError($"No such variable: ${lastVariableToken.Value}");
                         return null;
@@ -1192,29 +980,24 @@ namespace Antmicro.Renode.UserInterface
             }
         }
 
-        private string GetVariableName(string variableName)
+        private IDisposable EnterMachineContext(IMachine machine)
         {
-            var elements = variableName.Split(new[] { '.' }, 2);
-
-            if(elements.Length == 1 || (!elements[0].Equals("global") && !EmulationManager.Instance.CurrentEmulation.Names.Select(x => x.Replace("-", "_")).Any(x => x == elements[0])))
+            var machineContext = MonitorContext.EnterMachineContext(machine);
+            return DisposableWrapper.New(() =>
             {
-                if(CurrentMachine != null)
-                {
-                    variableName = String.Format("{0}.{1}", EmulationManager.Instance.CurrentEmulation[CurrentMachine].Replace("-", "_"), variableName);
-                }
-                else
-                {
-                    variableName = String.Format("global.{0}", variableName);
-                }
-            }
-            return variableName;
-        }
+                machineContext.Dispose();
 
-        private IDisposable ObtainMachineContext(IMachine machine)
-        {
-            var activeMachine = _currentMachine;
-            _currentMachine = machine;
-            return DisposableWrapper.New(() => _currentMachine = activeMachine);
+                // When overriding Machine it is impossible to verify at the time whether
+                // the monitor prompt should be changed as well.
+                var revertingOriginalMachine = monitorContextOverride.Value == null && !MonitorContext.IsMachineOverriden;
+
+                // It is possible thath `MachineRemove` event caused the Machine to be null, the prompt should be updated.
+                var possibleMissedMachineRemoval = revertingOriginalMachine && Machine == null;
+                if(possibleMissedMachineRemoval)
+                {
+                    MachineChanged?.Invoke(null);
+                }
+            });
         }
 
         private void PrintExceptionDetails(Exception e, ICommandInteraction writer, int tab = 0)
@@ -1253,9 +1036,9 @@ namespace Antmicro.Renode.UserInterface
                 return;
             }
 
-            using(ObtainMachineContext(machine))
+            using(EnterMachineContext(machine))
             {
-                if(TryExpandVariable(new VariableToken(macroName), macros, out var resetMacro))
+                if(MonitorContext.TryExpandVariable(new VariableToken(macroName), MonitorContext.Macros, out var resetMacro))
                 {
                     var macroLines = resetMacro.GetObjectValue().ToString().Split('\n');
                     foreach(var line in macroLines)
@@ -1266,76 +1049,85 @@ namespace Antmicro.Renode.UserInterface
             }
         }
 
-        private HashSet<Command> Commands { get; set; }
-
-        private IMachine CurrentMachine
+        private void SaveTokens(Token[] com)
         {
-            get
+            if(!RepeatLastCommand)
             {
-                return _currentMachine;
+                return;
             }
-
-            set
-            {
-                _currentMachine = value;
-
-                var mc = MachineChanged;
-                if(mc != null)
-                {
-                    mc(_currentMachine != null ? Emulation[_currentMachine] : null);
-                }
-            }
+            TokensOfLastExecutedCommand = com;
         }
+
+        private void SaveTokensIfOk(Token[] tokens, bool result)
+        {
+            if(!result)
+            {
+                return;
+            }
+            SaveTokens(tokens);
+        }
+
+        private HashSet<Command> Commands { get; set; }
 
         private Emulation Emulation
         {
             get
             {
-                return emulationManager.CurrentEmulation;
+                return EmulationManager.Instance.CurrentEmulation;
             }
         }
 
-        private IMachine _currentMachine;
         private string stringEaterVariableName = "";
-        private VariableType? recordingType;
+        private Monitor.VariableType? recordingType;
         private string stringEaterValue = "";
-        private int stringEaterMode;
-        private bool verboseMode;
+        private int stringEaterMode = 0;
 
-        private readonly MonitorPath monitorPath = new MonitorPath(Environment.CurrentDirectory);
-        private readonly bool swallowExceptions;
-        private readonly bool breakOnException;
+        private Token[] TokensOfLastExecutedCommand = null;
 
-        private readonly List<string> scannedFilesCache = new List<string>();
+        private MonitorContext monitorContext;
+        private readonly ThreadLocal<MonitorContext> monitorContextOverride = new ThreadLocal<MonitorContext>();
 
         private readonly MonitorPythonEngine pythonRunner;
 
-        private readonly EmulationManager emulationManager;
-
-        private readonly Dictionary<string, Func<object>> staticObjectDelegateMappings = new Dictionary<string, Func<object>>();
-        private readonly Dictionary<string, Func<object>> objectDelegateMappings = new Dictionary<string, Func<object>>();
-        private readonly Dictionary<string, Token> variables = new Dictionary<string, Token>();
-        private readonly Dictionary<string, Token> macros = new Dictionary<string, Token>();
-        private readonly Dictionary<string, Token> aliases = new Dictionary<string, Token>();
-        private readonly Dictionary<VariableType, Dictionary<string, Token>> variableCollections;
-
         private readonly Tokenizer.Tokenizer tokenizer = Tokenizer.Tokenizer.CreateTokenizer();
 
-        internal delegate void CommandHandler(IEnumerable<Token> p, ICommandInteraction w);
+        private readonly List<string> scannedFilesCache = new List<string>();
 
-        private const string GlobalVariablePrefix = "global.";
-
-        private const string ConfigurationSection = "monitor";
+        private readonly DeviceHandlingHelpers deviceHandlingHelpers;
 
         private const string EmulationToken = "emulation";
 
         private const string MultiLineTerminator = @"""""""";
 
-        private const string OriginVariable = GlobalVariablePrefix + "ORIGIN";
+        public class DeviceHandlingHelpers
+        {
+            public DeviceHandlingHelpers(Monitor monitor)
+            {
+                this.monitor = monitor;
+            }
 
-        private const string CurrentDirectoryVariable = GlobalVariablePrefix + "CWD";
+            public bool IsNameAvailable(string name)
+                => monitor.MonitorContext.IsNameAvailable(name);
 
-        private enum VariableType
+            public object IdentifyDevice(string name)
+                => monitor.MonitorContext.IdentifyDevice(name);
+
+            public object HandleDeviceChain(string name, out string chainedName, object device, IEnumerable<Token> tokens, out IEnumerable<Token> tail)
+                => monitor.HandleDeviceChain(name, out chainedName, device, tokens, out tail);
+
+            public bool ParseArgument(IList<Token> tokens, ref int i, out TokenList arg)
+                => Monitor.ParseArgument(tokens, ref i, out arg);
+
+            public bool FitArgumentType(TokenList tokens, Type paramType, out object result)
+                => monitor.FitArgumentType(tokens, paramType, out result);
+
+            public MemberInfo GetAccessor(object device, string member, bool? assertSetter = null, bool? assertGetter = null)
+                => monitor.GetAccessor(device, member, assertSetter, assertGetter);
+
+            private readonly Monitor monitor;
+        }
+
+        public enum VariableType
         {
             Variable,
             Macro,

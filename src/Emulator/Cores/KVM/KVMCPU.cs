@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -25,7 +25,8 @@ using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
-    public abstract class KVMCPU : BaseCPU, IGPIOReceiver, ICPUWithRegisters, IControllableCPU, ICPUWithMappedMemory, ICPUWithMMU, ICpuSupportingGdb
+    [SupportedRID("linux")]
+    public abstract class KVMCPU : BaseCPU, IGPIOReceiver, ICPUWithRegisters, IControllableCPU, ICPUWithMappedMemory, ICPUWithMMU, ICpuSupportingGdb, ICPUSupportingLLVMDisas
     {
         public KVMCPU(string cpuType, IMachine machine, Endianess endianess, CpuBitness cpuBitness, uint cpuId = 0)
             : base(cpuId, cpuType, machine, endianess, cpuBitness)
@@ -34,6 +35,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             hooks = new HookDescriptor(this);
             InitBinding();
             Init();
+            LLVMDisasContainer = new LLVMDisas(this);
             machine.PeripheralsChanged += OnMachinePeripheralsChanged;
         }
 
@@ -169,7 +171,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             if(ExecutionMode == ExecutionMode.SingleStep || singleStepAfterHook)
             {
-                var result = (ExecutionResult)KvmExecuteSingleStep();
+                ExecutionResult result;
+                lock(executionLock)
+                {
+                    result = (ExecutionResult)KvmExecuteSingleStep();
+                }
 
                 // Hooks are disabled after being hit. They can be reactivated after executing covered instruction.
                 if(singleStepAfterHook)
@@ -192,7 +198,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             var time = TimeInterval.FromCPUCycles(numberOfInstructionsToExecute, PerformanceInMips, out var cyclesResiduum).TotalMicroseconds;
 
             numberOfExecutedInstructions = numberOfInstructionsToExecute;
-            return (ExecutionResult)KvmExecute((ulong)time);
+
+            lock(executionLock)
+            {
+                return (ExecutionResult)KvmExecute((ulong)time);
+            }
         }
 
         public void EnterSingleStepModeSafely(HaltArguments args)
@@ -215,9 +225,34 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        public string GetCurrentLLVMTriple(out ulong pc)
+        {
+            if(Monitor.TryEnter(executionLock))
+            {
+                try
+                {
+                    pc = PC;
+                    return GetLLVMTriple(DisassemblyFlags);
+                }
+                finally
+                {
+                    Monitor.Exit(executionLock);
+                }
+            }
+            else
+            {
+                throw new RecoverableException("Unable to determine current LLVM triple while the KVMCPU is running. Please pause the CPU and try again.");
+            }
+        }
+
         public override string ToString()
         {
             return $"[CPU: {this.GetCPUThreadName(machine)}]";
+        }
+
+        public virtual IEnumerable<CPURegister> GetAllRegisters()
+        {
+            return GetRegisters();
         }
 
         public abstract void SetRegister(int register, RegisterValue value);
@@ -226,11 +261,23 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public abstract IEnumerable<CPURegister> GetRegisters();
 
+        public abstract string GetLLVMTriple(uint flags);
+
+        public uint DisassemblyFlags => KvmGetDisasFlags();
+
+        public LLVMDisas LLVMDisasContainer { get; init; }
+
         public override ulong ExecutedInstructions => throw new RecoverableException("ExecutedInstructions property is not implemented");
 
         public virtual uint PageSize => 4096;
 
         public abstract string GDBArchitecture { get; }
+
+        public abstract string[] AllLLVMTriples { get; }
+
+        public abstract string LLVMModel { get; }
+
+        public abstract Endianess DisassemblyHexFormatting { get; }
 
         public abstract List<GDBFeatureDescriptor> GDBFeatures { get; }
 
@@ -425,6 +472,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Import]
         protected Action<int, int> KvmSetIrq;
 
+        [Import]
+        protected Func<uint> KvmGetDisasFlags;
+
 #pragma warning restore 649
 
         protected string libraryFile;
@@ -441,30 +491,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected const int MaxRedirectionTableEntries = 24;
 
-        /*
-        Increments each time a new translation library resource is created.
-        This counter marks each new instance of a kvm library with a new number, which is used in file names to avoid collisions.
-        It has to survive emulation reset, so the file names remain unique.
-        */
-        private static int CpuCounter = 0;
-
         private void InitBinding()
         {
-            var libraryResource = $"Antmicro.Renode.kvm-{Architecture}.so";
-            foreach(var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if(assembly.TryFromResourceToTemporaryFile(libraryResource, out libraryFile, $"{CpuCounter}-{libraryResource}"))
-                {
-                    break;
-                }
-            }
-
-            Interlocked.Increment(ref CpuCounter);
-
-            if(libraryFile == null)
-            {
-                throw new ConstructionException($"Cannot find library {libraryResource}");
-            }
+            libraryFile = PlatformFileLoader.CopyPlatformFile($"kvm-{Architecture}.so");
 
             binder = new NativeBinder(this, libraryFile);
         }
@@ -485,6 +514,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 #pragma warning restore 649
 
         private readonly HookDescriptor hooks;
+
+        private readonly object executionLock = new object();
 
         protected class SegmentMappingWithSlotNumber : SegmentMapping
         {

@@ -4,7 +4,6 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-
 using System;
 using System.IO;
 
@@ -30,7 +29,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             DefineRegisters();
         }
 
-        // Linux-only
+        [SupportedRID("linux")]
         public void AttachToExternalCamera(HostCamera camera)
         {
             if(!RuntimeInfo.IsLinux())
@@ -40,7 +39,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             externalCamera = camera;
         }
 
-        // Linux-only
+        [SupportedRID("linux")]
         public void DetachFromExternalCamera()
         {
             if(!RuntimeInfo.IsLinux())
@@ -121,7 +120,7 @@ namespace Antmicro.Renode.Peripherals.Sensors
             sensor.Write(data);
         }
 
-        public byte[] Read(int count)
+        public byte[] Read(int count = 1)
         {
             return sensor.Read(count);
         }

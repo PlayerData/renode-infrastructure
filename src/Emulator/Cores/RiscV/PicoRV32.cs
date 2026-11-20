@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -19,7 +19,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public class PicoRV32 : RiscV32
     {
-        public PicoRV32(IMachine machine, string cpuType, bool latchedIrqs = true, uint hartId = 0, uint resetVectorAddress = 0x10) : base(machine, cpuType, null, hartId, PrivilegedArchitecture.Priv1_09, Endianess.LittleEndian)
+        public PicoRV32(IMachine machine, string cpuType, bool latchedIrqs = true, uint hartId = 0, uint resetVectorAddress = 0x10)
+            : base(machine, cpuType, null, hartId, PrivilegedArchitecture.Priv1_09, Endianess.LittleEndian, pmpEntryCount: 0)
         {
             this.latchedIrqs = latchedIrqs;
 
@@ -198,7 +199,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void HandleGetqInstruction(UInt64 opcode)
         {
-            var rd = (int)BitHelper.GetValue(opcode, 7, 5);
+            var rd = GetRd(opcode);
             var qs = (int)BitHelper.GetValue(opcode, 15, 2);
 
             if(rd != 0)
@@ -212,7 +213,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private void HandleSetqInstruction(UInt64 opcode)
         {
             var qd = (int)BitHelper.GetValue(opcode, 7, 2);
-            var rs = (int)BitHelper.GetValue(opcode, 15, 5);
+            var rs = GetRs1(opcode);
 
             qRegisters[qd] = X[rs];
 
@@ -240,8 +241,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void HandleMaskirqInstruction(UInt64 opcode)
         {
-            var rd = (int)BitHelper.GetValue(opcode, 7, 5);
-            var rs = (int)BitHelper.GetValue(opcode, 15, 5);
+            var rd = GetRd(opcode);
+            var rs = GetRs1(opcode);
 
             var newValue = (uint)X[rs].RawValue;
             var previousValue = disabledInterrupts;
@@ -270,8 +271,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void HandleTimerInstruction(UInt64 opcode)
         {
-            var rd = (int)BitHelper.GetValue(opcode, 7, 5);
-            var rs = (int)BitHelper.GetValue(opcode, 15, 5);
+            var rd = GetRd(opcode);
+            var rs = GetRs1(opcode);
 
             var previousValue = (uint)internalTimer.Value;
             var newValue = X[rs];

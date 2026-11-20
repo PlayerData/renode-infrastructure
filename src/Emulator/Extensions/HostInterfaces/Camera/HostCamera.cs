@@ -20,6 +20,7 @@ namespace Antmicro.Renode.HostInterfaces.Camera
 {
     public static class HostCameraExtensions
     {
+        [SupportedRID("linux")]
         public static void AddExternalCamera(this Emulation emulation, string device, string name = "camera")
         {
             var camera = new HostCamera(device);
@@ -28,7 +29,7 @@ namespace Antmicro.Renode.HostInterfaces.Camera
         }
     }
 
-    // Linux-only
+    [SupportedRID("linux")]
     public class HostCamera : IHostMachineElement
     {
         public HostCamera(string device)
@@ -130,8 +131,8 @@ namespace Antmicro.Renode.HostInterfaces.Camera
         // https://bitmiracle.github.io/libjpeg.net/help/articles/KB/compression-details.html
         private static byte[] CompressRawToJpeg(byte[] input, int width, int height, int scale, int quality, Tuple<int, int> crop)
         {
-            jpeg_error_mgr errorManager = new jpeg_error_mgr();
-            jpeg_compress_struct cinfo = new jpeg_compress_struct(errorManager);
+            var errorManager = new jpeg_error_mgr();
+            var cinfo = new jpeg_compress_struct(errorManager);
 
             var memoryStream = new MemoryStream();
             cinfo.jpeg_stdio_dest(memoryStream);

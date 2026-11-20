@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -13,12 +13,9 @@ using Antmicro.Migrant;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals;
-using Antmicro.Renode.UserInterface;
 
 namespace Antmicro.Renode.Core
 {
-    [Icon("comp")]
-    [ControllerMask(typeof(IExternal))]
     public class HostMachine : IExternal, IHasChildren<IHostMachineElement>, IDisposable
     {
         public HostMachine()

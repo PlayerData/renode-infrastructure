@@ -27,12 +27,13 @@ namespace Antmicro.Renode.Testing
 
     public class LEDTester : IExternal
     {
-        public LEDTester(ILed led, float defaultTimeout = 0)
+        public LEDTester(ILed led, float defaultTimeout = 0, bool defaultStartEmulation = true)
         {
             ValidateArgument(defaultTimeout, nameof(defaultTimeout), allowZero: true);
             this.led = led;
             this.machine = led.GetMachine();
             this.defaultTimeout = defaultTimeout;
+            this.defaultStartEmulation = defaultStartEmulation;
         }
 
         public LEDTester AssertState(bool state, float? timeout = null, bool pauseEmulation = false)
@@ -206,9 +207,9 @@ namespace Antmicro.Renode.Testing
                 timeoutEvent.WaitHandle.WaitOne();
 
                 var highPercentage = (double)highTicks / (highTicks + lowTicks) * 100;
-                if(highPercentage < expectedDutyCycle - (tolerance * 100) || expectedDutyCycle > expectedDutyCycle + (tolerance * 100))
+                if(highPercentage < (expectedDutyCycle - tolerance) * 100 || highPercentage > (expectedDutyCycle + tolerance) * 100)
                 {
-                    throw new InvalidOperationException($"Fill assertion not met: expected {expectedDutyCycle} with tolerance {tolerance * 100}%, but got {highPercentage}");
+                    throw new InvalidOperationException($"Fill assertion not met: expected {expectedDutyCycle * 100} with tolerance {tolerance * 100}%, but got {highPercentage}");
                 }
             }
             finally
@@ -347,7 +348,7 @@ namespace Antmicro.Renode.Testing
         private AutoResetEvent StartEmulationAndGetPausedEvent(Emulation emulation, bool pause)
         {
             var emulationPausedEvent = pause ? emulation.GetStartedStateChangedEvent(false) : null;
-            if(!emulation.IsStarted)
+            if(defaultStartEmulation && !emulation.IsStarted)
             {
                 emulation.StartAll();
             }
@@ -357,5 +358,6 @@ namespace Antmicro.Renode.Testing
         private readonly ILed led;
         private readonly IMachine machine;
         private readonly float defaultTimeout;
+        private readonly bool defaultStartEmulation;
     }
 }

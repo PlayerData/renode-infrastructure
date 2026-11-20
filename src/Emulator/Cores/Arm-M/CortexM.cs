@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 // Copyright (c) 2020-2021 Microsoft
 //
@@ -8,12 +8,15 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.IRQControllers;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities.Binding;
 
 using ELFSharp.ELF;
@@ -25,11 +28,13 @@ namespace Antmicro.Renode.Peripherals.CPU
     public partial class CortexM : Arm, IPeripheralWithTransactionState
     {
         public CortexM(string cpuType, IMachine machine, NVIC nvic, [NameAlias("id")] uint cpuId = 0, Endianess endianness = Endianess.LittleEndian,
-            uint? fpuInterruptNumber = null, uint? numberOfMPURegions = null, bool enableTrustZone = false, uint? numberOfSAURegions = null, uint? numberOfIDAURegions = null)
+            uint? fpuInterruptNumber = null, uint? numberOfMPURegions = null, bool enableTrustZone = false, uint? numberOfSAURegions = null, uint? numberOfIDAURegions = null, bool isCpuWaitSignalSet = false)
             : base(cpuType, machine, cpuId, endianness, numberOfMPURegions)
         {
             CpuWaitSignal = new GPIO();
+            CpuWaitSignal.Set(isCpuWaitSignalSet);
             CpuWaitSignal.AddStateChangedHook((state) => UpdateCPUWait(state));
+            IsHalted = CpuWaitSignal.IsSet;
 
             if(nvic == null)
             {
@@ -67,7 +72,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
             }
 
-            this.nvic = nvic;
+            NVIC = nvic;
             try
             {
                 nvic.AttachCPU(this);
@@ -83,11 +88,20 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override void Reset()
         {
-            var isCpuWaitSet = CpuWaitSignal.IsSet;
+            lock(reset)
+            {
+                var isCpuWaitSet = CpuWaitSignal.IsSet;
 
-            InnerReset();
+                if(isCpuWaitSet && releaseFromResetPending)
+                {
+                    machine.LocalTimeSource.CancelActionToExecuteInSyncedState(releaseFromResetCancellationToken);
+                    releaseFromResetPending = false;
+                }
 
-            IsHalted = isCpuWaitSet;
+                InnerReset();
+
+                IsHalted = isCpuWaitSet;
+            }
         }
 
         public override void OnGPIO(int number, bool value)
@@ -114,6 +128,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void SetSleepOnExceptionExit(bool value)
         {
             tlibSetSleepOnExceptionExit(value ? 1 : 0);
+        }
+
+        public void DoLazyFloatingPointStatePreservation(bool createContext = true)
+        {
+            tlibDoLazyFloatingPointStatePreservation(createContext ? 1u : 0u);
         }
 
         public uint GetFaultmask(bool secure)
@@ -203,6 +222,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
 
+        public uint? InitVectorTableOffsetNonSecure { get; set; } = null;
+
+        public uint? InitVectorTableOffset { get; set; } = null;
+
         public GPIO CpuWaitSignal { get; }
 
         public override string Architecture { get { return "arm-m"; } }
@@ -216,24 +239,24 @@ namespace Antmicro.Renode.Peripherals.CPU
                 var mProfileFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-profile");
                 for(var index = 0u; index <= 12; index++)
                 {
-                    mProfileFeature.Registers.Add(new GDBRegisterDescriptor(index, 32, $"r{index}", "uint32", "general"));
+                    mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.R0 + index, 32, $"r{index}", "uint32", "general"));
                 }
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(13, 32, "sp", "data_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(14, 32, "lr", "uint32", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(15, 32, "pc", "code_ptr", "general"));
-                mProfileFeature.Registers.Add(new GDBRegisterDescriptor(25, 32, "xpsr", "uint32", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.SP, 32, "sp", "data_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.LR, 32, "lr", "code_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PC, 32, "pc", "code_ptr", "general"));
+                mProfileFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.CPSR, 32, "xpsr", "uint32", "general"));    // cpsr is aliased to xpsr in tlibs
                 features.Add(mProfileFeature);
 
                 var mSystemFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-system");
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(26, 32, "msp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(27, 32, "psp", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(28, 32, "primask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(29, 32, "basepri", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(30, 32, "faultmask", "uint32", "general"));
-                mSystemFeature.Registers.Add(new GDBRegisterDescriptor(31, 32, "control", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPCURR, 32, "msp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPCURR, 32, "psp", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PRIMASK, 32, "primask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.BasePri, 32, "basepri", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.FAULTMASK, 32, "faultmask", "uint32", "general"));
+                mSystemFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.Control, 32, "control", "uint32", "general"));
                 features.Add(mSystemFeature);
 
-                bool hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
+                var hasMProfileVectorExtensions = GetArmFeature(ArmFeatures.ARM_FEATURE_MVE);
                 if(hasMProfileVectorExtensions)
                 {
                     var mveProfileFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.m-profile-mve");
@@ -252,30 +275,38 @@ namespace Antmicro.Renode.Peripherals.CPU
                     features.Add(mveProfileFeature);
                 }
 
+                if(TrustZoneEnabled)
+                {
+                    var mSecextFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.secext");
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPS, 32, "msp_s", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPS, 32, "psp_s", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.MSPNS, 32, "msp_ns", "uint32", "general"));
+                    mSecextFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.PSPNS, 32, "psp_ns", "uint32", "general"));
+                    features.Add(mSecextFeature);
+                }
+
                 // +++++ Important
                 // tlibs implement VFP using DOUBLE PRECISION FP (64 bit) registers.
                 // Each D (double) register holds two F (fp) registers! (arm/cpu.h)
                 // To keep consistency with tlibs, the code below uses D registers.
 
-                bool has32RegisterVfp = (GetArmFeature(ArmFeatures.ARM_FEATURE_VFP3)
+                var has32RegisterVfp = (GetArmFeature(ArmFeatures.ARM_FEATURE_VFP3)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_NEON)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_VFP4));
 
-                bool has16RegisterVfp = ((GetArmFeature(ArmFeatures.ARM_FEATURE_VFP_FP16)
+                var has16RegisterVfp = ((GetArmFeature(ArmFeatures.ARM_FEATURE_VFP_FP16)
                         || GetArmFeature(ArmFeatures.ARM_FEATURE_VFP))
                         && !has32RegisterVfp);
 
                 if(has32RegisterVfp || has16RegisterVfp)
                 {
                     var mVfpFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.vfp");
-                    const int vfpRegisterOffset = 42;
-                    int vfpRegisterEnd = has32RegisterVfp ? 31 : 15;
+                    var vfpRegisterEnd = has32RegisterVfp ? 31 : 15;
                     for(var reg = 0u; reg <= vfpRegisterEnd; reg++)
                     {
-                        mVfpFeature.Registers.Add(new GDBRegisterDescriptor(reg + vfpRegisterOffset, 64, $"d{reg}", "ieee_double", "float"));
+                        mVfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.D0 + reg, 64, $"d{reg}", "ieee_double", "float"));
                     }
-                    // The fpscr is always reg# = 74
-                    mVfpFeature.Registers.Add(new GDBRegisterDescriptor(74, 32, "fpscr", "int", "float"));
+                    mVfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)CortexMRegisters.FPSCR, 32, "fpscr", "int", "float"));
                     features.Add(mVfpFeature);
                 }
 
@@ -289,6 +320,21 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get => VectorTableOffset;
             set => VectorTableOffset = value;
+        }
+
+        public bool IsLockedUp => tlibIsLockedUp() != 0;
+
+        public bool IsUsingProcessSP
+        {
+            get
+            {
+                return tlibGetProcessSp() > 0;
+            }
+
+            set
+            {
+                tlibSetProcessSp(value ? 1u : 0u);
+            }
         }
 
         public UInt32 PmsaV8Mair0
@@ -409,6 +455,19 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             get => GetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), () => tlibGetPmsav8Mair(1, 0));
             set => SetTrustZoneRelatedRegister(nameof(PmsaV8Mair1_NS), val => tlibSetPmsav8Mair(1, val, 0), value);
+        }
+
+        public bool MPUPrivdefena
+        {
+            get
+            {
+                return tlibIsPrivdefenaEnabled() != 0;
+            }
+
+            set
+            {
+                tlibSetPrivdefena(value ? 1u : 0u);
+            }
         }
 
         public bool MPUEnabled
@@ -555,9 +614,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             set
             {
                 vtorInitialized = true;
-                if(!machine.SystemBus.IsMemory(value, this, secureState))
+                if(machine.SystemBus.WhatPeripheralIsAt(value, this, secureState) == null)
                 {
-                    this.Log(LogLevel.Warning, "Tried to set VTOR address at 0x{0:X} which does not lay in memory. Aborted.", value);
+                    this.Log(LogLevel.Warning, "Tried to set VTOR address at 0x{0:X} which is not mapped on the system bus. Aborted.", value);
                     return;
                 }
                 this.NoisyLog("VectorTableOffset set to 0x{0:X}.", value);
@@ -584,9 +643,9 @@ namespace Antmicro.Renode.Peripherals.CPU
                     throw new RecoverableException("You need to enable TrustZone to use VTOR_NS");
                 }
                 vtorInitialized = true;
-                if(!machine.SystemBus.IsMemory(value, this))
+                if(machine.SystemBus.WhatPeripheralIsAt(value, this) == null)
                 {
-                    this.Log(LogLevel.Warning, "Tried to set VTOR_NS address at 0x{0:X} which does not lay in memory. Aborted.", value);
+                    this.Log(LogLevel.Warning, "Tried to set VTOR_NS address at 0x{0:X} which is not mapped on the system bus. Aborted.", value);
                     return;
                 }
                 this.NoisyLog("VectorTableOffset_NS set to 0x{0:X}.", value);
@@ -656,6 +715,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public bool TrustZoneEnabled { get; }
+
+        public NVIC NVIC { get; }
 
         public UInt32 FaultStatus
         {
@@ -747,6 +808,18 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        public UInt32 ConfigurationAndControlRegister
+        {
+            get => tlibGetCcr(ShouldAccessBeSecure());
+            set => tlibSetCcr(value, ShouldAccessBeSecure());
+        }
+
+        public UInt32 ConfigurationAndControlRegisterNonSecure
+        {
+            get => GetTrustZoneRelatedRegister(nameof(ConfigurationAndControlRegisterNonSecure), () => tlibGetCcr(0u));
+            set => SetTrustZoneRelatedRegister(nameof(ConfigurationAndControlRegisterNonSecure), val => tlibSetCcr(val, 0u), value);
+        }
+
         public UInt32 PmsaV8Rnr
         {
             get
@@ -772,11 +845,19 @@ namespace Antmicro.Renode.Peripherals.CPU
             set => SetTrustZoneRelatedRegister(nameof(PmsaV8Rnr_NS), val => tlibSetPmsav8Rnr(val, 0), value);
         }
 
+        public uint ArchitectureVersion
+        {
+            get
+            {
+                return tlibGetArchitectureVersion();
+            }
+        }
+
         public bool IsV8
         {
             get
             {
-                return tlibIsV8() > 0;
+                return tlibGetArchitectureVersion() >= 8;
             }
         }
 
@@ -835,16 +916,6 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public const uint IDAU_SAURegionAddressMask = ~(IDAU_SAURegionMinSize - 1u);
 
-        protected override void OnResume()
-        {
-            // Suppress initialization when processor is turned off as binary may not even be loaded yet
-            if(!IsHalted)
-            {
-                InitPCAndSP();
-            }
-            base.OnResume();
-        }
-
         protected override UInt32 BeforePCWrite(UInt32 value)
         {
             if(value % 2 == 0)
@@ -860,6 +931,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             if(EmulationState == EmulationCPUState.Running)
             {
+                TryInitVTOR();
                 InitPCAndSP();
             }
             base.OnLeavingResetState();
@@ -886,16 +958,34 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void UpdateCPUWait(bool state)
         {
-            if(!state)
+            void releaseFromReset(TimeStamp _)
             {
-                IsHalted = false;
+                if(EmulationState == EmulationCPUState.InReset)
+                {
+                    IsHalted = false;
+                    Resume();
+                }
+            }
+            lock(reset)
+            {
+                if(!state)
+                {
+                    // Clear the reset pause, keeping CPUWAIT's halt until the synchronized release.
+                    if(!machine.IsPaused && EmulationState == EmulationCPUState.InReset)
+                    {
+                        ClearPauseWhileHalted();
+                    }
+                    var now = new TimeStamp(machine.LocalTimeSource.ElapsedVirtualTime, machine.LocalTimeSource.Domain);
+                    releaseFromResetCancellationToken = machine.LocalTimeSource.ExecuteInSyncedState(releaseFromReset, now);
+                    releaseFromResetPending = true;
+                }
             }
         }
 
         [Export]
         private int FindPendingIRQ()
         {
-            return nvic?.FindPendingInterrupt() ?? 0;
+            return NVIC?.FindPendingInterrupt() ?? 0;
         }
 
         [Export]
@@ -919,13 +1009,13 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private uint InterruptTargetsSecure(int interruptNumber)
         {
-            return nvic.GetTargetInterruptSecurityState(interruptNumber) == NVIC.InterruptTargetSecurityState.Secure ? 1u : 0u;
+            return NVIC.GetTargetInterruptSecurityState(interruptNumber) == NVIC.InterruptTargetSecurityState.Secure ? 1u : 0u;
         }
 
         [Export]
         private int PendingMaskedIRQ()
         {
-            return nvic.MaskedInterruptPresent ? 1 : 0;
+            return NVIC.MaskedInterruptPresent ? 1 : 0;
         }
 
         [Export]
@@ -933,24 +1023,24 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             if(secure > 0)
             {
-                nvic.BASEPRI_S = (byte)value;
+                NVIC.BASEPRI_S = (byte)value;
             }
             else
             {
-                nvic.BASEPRI_NS = (byte)value;
+                NVIC.BASEPRI_NS = (byte)value;
             }
         }
 
         [Export]
-        private void CompleteIRQ(int number)
+        private int CompleteIRQ(int number)
         {
-            nvic.CompleteIRQ(number);
+            return NVIC.CompleteIRQ(number) ? 1 : 0;
         }
 
         [Export]
         private int AcknowledgeIRQ()
         {
-            return nvic?.AcknowledgeIRQ() ?? 0;
+            return NVIC?.AcknowledgeIRQ() ?? 0;
         }
 
         private uint ShouldAccessBeSecure()
@@ -971,6 +1061,18 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return 0x0;
             }
             return getter();
+        }
+
+        private void TryInitVTOR()
+        {
+            if(InitVectorTableOffset != null)
+            {
+                VectorTableOffset = InitVectorTableOffset.Value;
+            }
+            if(InitVectorTableOffsetNonSecure != null)
+            {
+                VectorTableOffsetNonSecure = InitVectorTableOffsetNonSecure.Value;
+            }
         }
 
         private void InitPCAndSP()
@@ -999,18 +1101,36 @@ namespace Antmicro.Renode.Peripherals.CPU
                 // stack pointer and program counter are being sent according
                 // to VTOR (vector table offset register)
                 var sysbus = machine.SystemBus;
-                var pc = sysbus.ReadDoubleWordWithState(VectorTableOffset + 4, this, secureState);
-                var sp = sysbus.ReadDoubleWordWithState(VectorTableOffset, this, secureState);
-                if(!sysbus.IsMemory(pc, this, secureState) || (pc == 0 && sp == 0))
+                uint pc;
+                uint sp;
+                try
                 {
-                    this.Log(LogLevel.Error, "PC does not lay in memory or PC and SP are equal to zero. CPU was halted.");
-                    IsHalted = true;
-                    return; // Keep PC and SP uninitialized in the case of error condition
+                    pc = sysbus.ReadDoubleWordWithState(VectorTableOffset + 4, this, secureState);
+                    sp = sysbus.ReadDoubleWordWithState(VectorTableOffset, this, secureState);
+                }
+                catch(BusAccessException)
+                {
+                    EnterResetLockup();
+                    pcNotInitialized = false;
+                    return;
                 }
                 this.Log(LogLevel.Info, "Setting initial values: PC = 0x{0:X}, SP = 0x{1:X}.", pc, sp);
-                PC = pc;
+                // Armv8-M ARM rule RKSCH and TakeReset(): reset vector bit[0]
+                // initializes EPSR.T. Bypass the Thumb-forcing patch in
+                // CortexM.BeforePCWrite() by writing the register directly.
+                SetRegisterValue32((int)CortexMRegisters.PC, base.BeforePCWrite(pc));
+                pcNotInitialized = false;
                 SP = sp;
             }
+        }
+
+        private void EnterResetLockup()
+        {
+            // Armv8-M ARM rule RBHVG and pseudocode operation TakeReset:
+            // a BusFault reading the initial MSP or reset vector enters
+            // Lockup with HardFault active and HFSR.VECTTBL set.
+            NVIC.EnterResetLockup(TrustZoneEnabled);
+            tlibEnterResetLockup();
         }
 
         /// <remarks>Use <see cref="GetTrustZoneRelatedRegister"/> and <see cref="SetTrustZoneRelatedRegister"/> to wrap accesses which have to succeed.</remarks>
@@ -1029,9 +1149,53 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
+        private uint IsSTIRAddress(uint address)
+        {
+            return machine.SystemBus.GetRegistrationPoints(NVIC)
+                .Where(p => address == p.Range.StartAddress + NVIC.STIROffset)
+                .Any() ? 1u : 0u;
+        }
+
+        [Export]
         private void SetPendingIRQ(int number)
         {
-            nvic.SetPendingIRQ(number);
+            NVIC.SetPendingIRQ(number);
+        }
+
+        [Export]
+        private int SetPendingSynchronousFault(int number)
+        {
+            return (int)NVIC.SetPendingSynchronousFault(number);
+        }
+
+        [Export]
+        private int SetPendingStackingFault(int number, int originalException)
+        {
+            return (int)NVIC.SetPendingStackingFault(number, originalException);
+        }
+
+        [Export]
+        private int SetPendingVectorFault(int secure, int originalException, int ignoreFaults)
+        {
+            return (int)NVIC.SetPendingVectorFault(secure != 0, originalException, ignoreFaults != 0);
+        }
+
+        [Export]
+        private uint GetFpccrReadyBits(int originalException, int secure)
+        {
+            return NVIC.GetFpccrReadyBits(originalException, secure != 0);
+        }
+
+        [Export]
+        private int SetPendingLazyFpFault(int number, uint fpccr)
+        {
+            return (int)NVIC.SetPendingLazyFpFault(number, fpccr);
+        }
+
+        [Export]
+        private void OnLockupStateChange(int value)
+        {
+            NVIC.SetLockupState(value != 0);
         }
 
         private void SetTrustZoneRelatedRegister(string registerName, Action<uint> setter, uint value)
@@ -1047,6 +1211,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private CortexMImplementationDefinedAttributionUnit idau;
         private bool pcNotInitialized = true;
         private bool vtorInitialized;
+        private bool releaseFromResetPending;
+        private ulong releaseFromResetCancellationToken;
+        private readonly object reset = new object();
 
 #pragma warning disable 649
         // 649:  Field '...' is never assigned to, and will always have its default value null
@@ -1056,6 +1223,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         /* TrustZone SAU */
         [Import]
         private readonly Action<uint> tlibSetNumberOfSauRegions;
+
+        [Import]
+        private readonly Func<uint> tlibGetProcessSp;
+
+        [Import]
+        private readonly Action<uint> tlibSetProcessSp;
 
         [Import]
         private readonly Func<uint, uint, uint> tlibTryRemoveImplementationDefinedExemptionRegion;
@@ -1144,7 +1317,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<int, uint> GetRegisterValue32NonSecure;
 
         [Import]
-        private readonly Func<uint> tlibIsV8;
+        private readonly Func<uint> tlibGetArchitectureVersion;
 
         [Import]
         private readonly Func<uint> tlibGetSecurityState;
@@ -1162,6 +1335,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<uint, uint> tlibGetMemoryFaultAddress;
 
         [Import]
+        private readonly Action tlibEnterResetLockup;
+
+        [Import]
+        private readonly Func<uint> tlibIsLockedUp;
+
+        [Import]
         private readonly Func<uint> tlibGetSecureFaultAddress;
 
         [Import]
@@ -1172,6 +1351,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Action<int> tlibEnableMpu;
+
+        [Import]
+        private readonly Action<uint> tlibSetPrivdefena;
+
+        [Import]
+        private readonly Func<uint> tlibIsPrivdefenaEnabled;
 
         [Import]
         private readonly Func<int> tlibIsMpuEnabled;
@@ -1204,6 +1389,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint, uint> tlibSetInterruptVectorBase;
 
         [Import]
+        private readonly Func<uint, uint> tlibGetCcr;
+
+        [Import]
+        private readonly Action<uint, uint> tlibSetCcr;
+
+        [Import]
         private readonly Func<uint> tlibGetXpsr;
 
         [Import]
@@ -1211,6 +1402,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Func<uint, uint> tlibGetPrimask;
+
+        [Import]
+        private readonly Action<uint> tlibDoLazyFloatingPointStatePreservation;
 
         [Import]
         private readonly Func<uint, uint> tlibGetFaultmask;
@@ -1229,20 +1423,20 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<uint, uint, uint> tlibGetPmsav8Mair;
 #pragma warning restore 649
 
-        private readonly NVIC nvic;
-
         public class ContextState : IContextState
         {
             public bool Privileged;
             public bool CpuSecure;
             public bool AttributionSecure;
+            public bool Semihosting;
 
             public static implicit operator ulong(ContextState stateObj)
             {
-                var state = 0u;
-                state |= (stateObj.Privileged ? 1u : 0) & 1u;
-                state |= (stateObj.CpuSecure ? 2u : 0) & 2u;
-                state |= (stateObj.AttributionSecure ? 4u : 0) & 4u;
+                var state = 0UL;
+                state |= stateObj.Privileged ? 1UL : 0;
+                state |= stateObj.CpuSecure ? 2UL : 0;
+                state |= stateObj.AttributionSecure ? 4UL : 0;
+                state |= stateObj.Semihosting ? 8UL : 0;
                 return state;
             }
 
@@ -1250,9 +1444,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 return new ContextState
                 {
-                    Privileged = (state & 1u) == 1u,
-                    CpuSecure = (state & 2u) == 2u,
-                    AttributionSecure = (state & 4u) == 4u,
+                    Privileged = (state & 1UL) == 1UL,
+                    CpuSecure = (state & 2UL) == 2UL,
+                    AttributionSecure = (state & 4UL) == 4UL,
+                    Semihosting = (state & 8UL) == 8UL,
                 };
             }
         }
@@ -1347,13 +1542,15 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private static readonly CpuSignal FirstSignalNumber = CpuSignal.CpuWait;
 
-        private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
+        private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true, Semihosting = false };
 
+        /* Must be in sync with C structure in tlib in cpu_get_state_for_memory_transaction */
         private static readonly IReadOnlyDictionary<string, int> stateBits = new Dictionary<string, int>
         {
             ["privileged"] = 0,
             ["cpuSecure"] = 1,
             ["attributionSecure"] = 2,
+            ["semihosting"] = 3,
         };
     }
 }

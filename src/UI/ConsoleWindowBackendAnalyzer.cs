@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -18,7 +18,7 @@ using AntShell.Terminal;
 
 namespace Antmicro.Renode.UI
 {
-    public class ConsoleWindowBackendAnalyzer : IAnalyzableBackendAnalyzer<UARTBackend>, IDisposable, IDisconnectableState
+    public class ConsoleWindowBackendAnalyzer : IUARTBackendAnalyzer, IDisposable, IDisconnectableState
     {
         // Default constructor is required for the showAnalyzer command.
         public ConsoleWindowBackendAnalyzer() : this(false)
@@ -56,7 +56,7 @@ namespace Antmicro.Renode.UI
 
         public void Show()
         {
-            var availableProviders = TypeManager.Instance.AutoLoadedTypes.Where(x => !x.IsAbstract && typeof(IConsoleBackendAnalyzerProvider).IsAssignableFrom(x)).ToDictionary(x => GetProviderName(x), x => x);
+            var availableProviders = TypeManager.Instance.AutoLoadedTypes.Where(x => !x.IsAbstract && typeof(IConsoleBackendAnalyzerProvider).IsAssignableFrom(x) && x.IsRIDSupported()).ToDictionary(x => GetProviderName(x), x => x);
             var preferredProvider = ConfigurationManager.Instance.Get("general", "terminal", "XTerm");
 
             foreach(var providerName in availableProviders.Keys.OrderByDescending(x => x == preferredProvider))
@@ -123,6 +123,18 @@ namespace Antmicro.Renode.UI
         public IOProvider IO { get; private set; }
 
         public ISizeSource SizeSource { get; private set; }
+
+        public UartExtensions.LineEnding LineEnding
+        {
+            get => ((UARTBackend)Backend).LineEnding;
+            set => ((UARTBackend)Backend).LineEnding = value;
+        }
+
+        public bool SelfEcho
+        {
+            get => ((UARTBackend)Backend).SelfEcho;
+            set => ((UARTBackend)Backend).SelfEcho = value;
+        }
 
         public event Action Quitted;
 

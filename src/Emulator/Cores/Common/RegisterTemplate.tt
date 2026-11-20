@@ -31,7 +31,7 @@
     }
 
     RegistersEnumParser parser;
-    var baseDirectoryPath = Directory.GetParent(BASE_PATH).Parent.Parent.Parent.FullName;
+    var baseDirectoryPath = Directory.GetParent(BASE_PATH).FullName;
     var fullPath = Path.Combine(baseDirectoryPath, HEADER_FILE);
     using(var stream = File.OpenRead(fullPath))
     {
@@ -192,22 +192,21 @@ namespace Antmicro.Renode.Peripherals.CPU
 #>
         }
 
-        public <#=OVERRIDE#>IEnumerable<CPURegister> GetRegisters()
-        {
 <#
     if(FALLBACK_REGISTERS != null)
     {
 #>
+        public <#=OVERRIDE#>IEnumerable<CPURegister> GetAllRegisters()
+        {
             return mapping.Values.Concat(<#=FALLBACK_REGISTERS#>()).OrderBy(x => x.Index);
+        }
+
 <#
     }
-    else
-    {
 #>
+        public <#=OVERRIDE#>IEnumerable<CPURegister> GetRegisters()
+        {
             return mapping.Values.OrderBy(x => x.Index);
-<#
-    }
-#>
         }
 <#
     foreach(var register in parser.Registers.Where(x => !x.IsIgnored))

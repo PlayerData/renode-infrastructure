@@ -6,6 +6,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
@@ -30,7 +31,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 owner: this,
                 localName: "transaction-delay",
                 enabled: false,
-                workMode: WorkMode.OneShot
+                workMode: WorkMode.Periodic
             ));
         }
 
@@ -104,6 +105,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithTaggedFlag("NOSTRETCH", 7)
                 .WithFlag(8, out start, name: "START")
                 .WithFlag(9, out stop, name: "STOP")
+                // On our abstraction level we don't model ACK/NACK bits of the protocol.
+                // Each transmission ends with write to STOP, and this is the moment
+                // when Renode knows to report end of transmission to the slave
                 .WithTaggedFlag("ACK", 10)
                 .WithTaggedFlag("POS", 11)
                 .WithTaggedFlag("PEC", 12)
@@ -111,55 +115,100 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithReservedBits(14, 1)
                 .WithTaggedFlag("SWRST", 15)
                 .WithReservedBits(16, 16)
-                .WithWriteCallback((_, __) =>
+                .WithWriteCallback((oldValue, newValue) =>
                 {
                     lock(updateLock)
                     {
                         var updateInterrupts = start.Value || stop.Value;
                         var restart = start.Value && dataState != DataState.Idle && dataState != DataState.WriteAddress;
-                        if(stop.Value || restart)
+                        if(stop.Value)
                         {
-                            if(dataDirection.Value == Direction.Transmit)
-                            {
-                                if(data.Count > 0)
-                                {
-                                    this.DebugLog("Writing to 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
-                                    child?.Write(data.DequeueAll());
-                                }
-                                this.DebugLog("{0} transmission", stop.Value ? "Stopping" : "Restarting");
-                                child?.FinishTransmission();
-                                data.Clear();
-                                byteTransferFinished.Value = false;
-                                txDataEmpty.Value = false;
-                                stop.Value = false;
-                                dataState = DataState.Idle;
-                                UpdateIdle();
-                            }
-                            else
-                            {
-                                dataState = DataState.LastRead;
-                            }
-                            mode.Value = Mode.Slave;
+                            if(HandleStop(oldValue, newValue)) return;
                         }
+                        else if(restart)
+                        {
+                            HandleRestart();
+                        }
+
                         if(start.Value)
                         {
-                            if(!restart)
-                            {
-                                this.DebugLog("Starting transmission");
-                            }
-
-                            mode.Value = Mode.Master;
-                            startBit.Value = true;
-                            byteTransferFinished.Value = false;
-                            txDataEmpty.Value = false;
-                            dataDirection.Value = Direction.Default;
-                            dataState = DataState.WriteAddress;
-                            start.Value = false;
+                            HandleStart(restart);
                         }
                         if(updateInterrupts)
                         {
                             UpdateInterrupts();
                         }
+                    }
+
+                    bool HandleStop(ulong oldVal, ulong newVal)
+                    {
+                        if(dataDirection.Value == Direction.Transmit)
+                        {
+                            if(data.Count > 0)
+                            {
+                                this.DebugLog("Writing to 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
+                                child?.Write(data.DequeueAll());
+                            }
+                            this.DebugLog("Stopping transmission");
+                            child?.FinishTransmission();
+                            data.Clear();
+                            byteTransferFinished.Value = false;
+                            txDataEmpty.Value = false;
+                            stop.Value = false;
+                            dataState = DataState.Idle;
+                            UpdateIdle();
+                        }
+                        else
+                        {
+                            bool wasStop = (oldValue & StopBitMask) != 0;
+                            bool isStop = (newValue & StopBitMask) != 0;
+                            // Single-byte case: For multi-byte reads, the last byte is readed by handleDataread()
+                            // with LastRead to end the transmission. Since this doesn't happen for a
+                            // single-byte read, the processor attempts to restart transmission by setting the stop bit again
+                            if(wasStop && isStop)
+                            {
+                                this.DebugLog("Stopping transmission");
+                                child?.FinishTransmission();
+                                dataState = DataState.Idle;
+                                UpdateIdle();
+                                // Emulate the hardware behavior of clearing the STOP bit after the STOP condition is emitted
+                                stop.Value = false;
+                                return true;
+                            }
+
+                            dataState = DataState.LastRead;
+                        }
+                        mode.Value = Mode.Slave;
+                        return false;
+                    }
+
+                    void HandleRestart()
+                    {
+                        this.DebugLog("Restarting transmission");
+                        if(dataDirection.Value == Direction.Transmit && data.Count > 0)
+                        {
+                            this.DebugLog("Writing to 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
+                            child?.Write(data.DequeueAll());
+                        }
+                        data.Clear();
+                        byteTransferFinished.Value = false;
+                        txDataEmpty.Value = false;
+                    }
+
+                    void HandleStart(bool isRestart)
+                    {
+                        if(!isRestart)
+                        {
+                            this.DebugLog("Starting transmission");
+                        }
+
+                        mode.Value = Mode.Master;
+                        startBit.Value = true;
+                        byteTransferFinished.Value = false;
+                        txDataEmpty.Value = false;
+                        dataDirection.Value = Direction.Default;
+                        dataState = DataState.WriteAddress;
+                        start.Value = false;
                     }
                 })
             ;
@@ -292,10 +341,13 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private void ExecuteScheduledAction()
         {
-            lock(updateLock)
+            if(!Monitor.TryEnter(updateLock))
             {
-                scheduledAction?.Invoke();
+                return;
             }
+
+            scheduledAction?.Invoke();
+            Monitor.Exit(updateLock);
         }
 
         private void UpdateSchedule(bool? enable = null)
@@ -324,12 +376,12 @@ namespace Antmicro.Renode.Peripherals.I2C
                 this.NoisyLog("TxE updated in scheduled action");
                 txDataEmpty.Value = true;
                 byteTransferFinished.Value = false;
-                QueueUpdate(UpdateDataTransmission);
             }
             else
             {
                 this.NoisyLog("TxE's BTF updated in scheduled action");
                 byteTransferFinished.Value = true;
+                FinishScheduledAction();
             }
             UpdateInterrupts();
         }
@@ -341,14 +393,24 @@ namespace Antmicro.Renode.Peripherals.I2C
                 this.NoisyLog("RxNE updated in scheduled action");
                 rxDataNotEmpty.Value = true;
                 byteTransferFinished.Value = false;
-                QueueUpdate(UpdateDataReceive);
             }
             else if(dataState != DataState.LastRead)
             {
                 this.NoisyLog("RxNE's BTF updated in scheduled action");
                 byteTransferFinished.Value = true;
+                FinishScheduledAction();
             }
             UpdateInterrupts();
+        }
+
+        private void FinishScheduledAction()
+        {
+            lock(updateLock)
+            {
+                scheduledAction = null;
+                machine.ClockSource.ExchangeClockEntryWith(ExecuteScheduledAction,
+                    entry => entry.With(enabled: false));
+            }
         }
 
         private void HandleDataWrite(byte value)
@@ -411,6 +473,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 case DataState.WriteData:
                     data.Enqueue(value);
                     txDataEmpty.Value = true;
+                    QueueUpdate(UpdateDataTransmission);
                     break;
                 default:
                     this.WarningLog("Writing data in improper state ({0}), ignoring", dataState);
@@ -461,7 +524,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                     QueueUpdate(UpdateDataReceive);
                     break;
                 default:
-                    this.WarningLog("Reading data in improper state ({0}), returning 0x0", dataState);
+                    // STM32 LL HAL uses `MODIFY_REG` to access this register on Write path
+                    // so it's expected that the software using LL HAL API will perform a read
+                    this.DebugLog("Reading data in improper state ({0}), returning 0x0", dataState);
                     break;
                 }
 
@@ -567,6 +632,8 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private const ulong MinimalFrequency = 2;
         private const ulong MaximalFrequency = 42;
+
+        private const int StopBitMask = 1 << 9;
 
         public enum Registers
         {

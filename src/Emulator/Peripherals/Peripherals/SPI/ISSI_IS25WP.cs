@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -7,6 +7,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core.Structure.Registers;
@@ -32,9 +33,10 @@ namespace Antmicro.Renode.Peripherals.SPI
                 throw new ConstructionException($"'{nameof(underlyingMemory)}' size should be a power of 2");
             }
 
-            if(underlyingMemory.Size % 64.KB() > 0)
+            var blockSizeBytes = (blockSize == BlockSize._256KB ? 256 : 64).KB();
+            if(underlyingMemory.Size % blockSizeBytes > 0)
             {
-                throw new ConstructionException($"'{nameof(underlyingMemory)}' size should be divisible by 64KB");
+                throw new ConstructionException($"'{nameof(underlyingMemory)}' size should be divisible by {Misc.NormalizeBinary(blockSizeBytes)}");
             }
 
             bankAddressRegister = new ByteRegister(this)
@@ -77,7 +79,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 sectorsNum = underlyingMemory.Size / 256.KB(); // Memory is uniformly divided in 256KB blocks
                 break;
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             blockConfiguration = Misc.Iterate(BlockConfiguration.Create)
@@ -189,7 +191,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             default:
                 // NOTE: This is not possible as we have already checked that register is defined in InternalRegisters
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
         }
 
@@ -249,12 +251,10 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             default:
                 // NOTE: This is not possible as we have already checked that register is defined in InternalRegisters
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
-            // NOTE: Explicit declaration is required by mono compiler
-            byte data = default(byte);
-            if(currentRegisterValue?.TryDequeue(out data) ?? false)
+            if(currentRegisterValue?.TryDequeue(out var data) ?? false)
             {
                 return data;
             }
@@ -359,7 +359,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             default:
                 // NOTE: This is not possible as we have already checked that firstByte is defined in InternalCommands
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
         }
 
@@ -399,7 +399,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 return (int)(address / 256.KB());
 
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
         }
 

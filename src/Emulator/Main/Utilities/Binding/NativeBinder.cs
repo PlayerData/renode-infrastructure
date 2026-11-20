@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -57,21 +57,17 @@ namespace Antmicro.Renode.Utilities.Binding
         /// </description></item>
         /// </list>
         /// </remarks>
-        public NativeBinder(IEmulationElement classToBind, string libraryFile)
+        public NativeBinder(object classToBind, string libraryFile)
         {
             delegateStore = new object[0];
-#if !PLATFORM_WINDOWS && !NET
-            // According to https://github.com/dotnet/runtime/issues/26381#issuecomment-394765279,
-            // mono does not enforce the restrictions on pinned GCHandle objects.
-            // On .NET Core trying to pin unallowed object throws exception about non-primitive or non-blittable data.
-            handles = new GCHandle[0];
-#endif
             this.classToBind = classToBind;
             libraryAddress = SharedLibraries.LoadLibrary(libraryFile);
             libraryFileName = libraryFile;
-            var importFields = classToBind.GetType().GetAllFields().Where(x => x.IsDefined(typeof(ImportAttribute), false)).ToList();
+            var classType = classToBind.GetType().IsSubclassOf(typeof(Type)) ? (Type)classToBind : classToBind.GetType();
+            var importFields = classType.GetAllFields().Where(x => x.IsDefined(typeof(ImportAttribute), false)).ToList();
             EnsureWrappersType(importFields);
-            wrappersObj = CreateWrappersObject();
+            exceptionKeeper = new ExceptionKeeper();
+            wrappersObj = CreateWrappersObject(exceptionKeeper);
             try
             {
                 ResolveCallsToNative(importFields);
@@ -86,15 +82,26 @@ namespace Antmicro.Renode.Utilities.Binding
 
         public void Dispose()
         {
+            exceptionKeeper.Dispose();
             DisposeInner();
             GC.SuppressFinalize(this);
         }
 
+        private static string TypeName(Type t)
+        {
+            if(t.IsByRef)
+            {
+                // In/out/ref parameters
+                return "IntPtr";
+            }
+            return t.Name.Replace("[]", "Array");
+        }
+
         private static string ShortTypeNameFromParamsAndReturn(IEnumerable<Type> parameterTypes, Type returnType)
         {
-            var baseName = returnType == typeof(void) ? "Action" : "Func" + returnType.Name;
-            var paramNames = parameterTypes.Select(p => p.Name);
-            return string.Join("", paramNames.Prepend(baseName)).Replace("[]", "Array");
+            var baseName = returnType == typeof(void) ? "Action" : "Func" + TypeName(returnType);
+            var paramNames = parameterTypes.Select(TypeName);
+            return string.Join("", paramNames.Prepend(baseName));
         }
 
         private static string GetCName(string name)
@@ -203,12 +210,6 @@ namespace Antmicro.Renode.Utilities.Binding
 
         private void DisposeInner()
         {
-#if !PLATFORM_WINDOWS && !NET
-            foreach(var handle in handles)
-            {
-                handle.Free();
-            }
-#endif
             if(libraryAddress != IntPtr.Zero)
             {
                 SharedLibraries.UnloadLibrary(libraryAddress);
@@ -228,7 +229,12 @@ namespace Antmicro.Renode.Utilities.Binding
             // just use it without verifying its layout.
             // Its name is derived from the full name of the class to bind (including its namespace): for example,
             // the wrappers type for Some.Namespace.Class will be NativeBinder.Some.Namespace.ClassWrappers.
-            var wrappersTypeName = $"NativeBinder.{classToBind.GetType().FullName}Wrappers";
+
+            // GetType and DefineType might handle some special characters differently
+            // DefineType tends to escape them, even in GetType().FullName doesn't have them escaped
+            // Let's just replace them at this point, since we only want to create a new type
+            // '+' is used in nested classes.
+            var wrappersTypeName = $"NativeBinder.{classToBind.GetType().FullName}Wrappers".Replace("+", "__");
 
             lock(moduleBuilder)
             {
@@ -236,6 +242,7 @@ namespace Antmicro.Renode.Utilities.Binding
 
                 if(wrappersType == null)
                 {
+                    // If this line crashes, see explanation above wrappersTypeName
                     var typeBuilder = moduleBuilder.DefineType(wrappersTypeName);
                     typeBuilder.DefineField(nameof(ExceptionKeeper), typeof(ExceptionKeeper), FieldAttributes.Public);
                     typeBuilder.DefineField(nameof(classToBind), classToBind.GetType(), FieldAttributes.Public);
@@ -257,10 +264,10 @@ namespace Antmicro.Renode.Utilities.Binding
             }
         }
 
-        private object CreateWrappersObject()
+        private object CreateWrappersObject(ExceptionKeeper keeper)
         {
             var wrappers = Activator.CreateInstance(wrappersType);
-            exceptionKeeperField.SetValue(wrappers, new ExceptionKeeper());
+            exceptionKeeperField.SetValue(wrappers, keeper);
             instanceField.SetValue(wrappers, classToBind);
             return wrappers;
         }
@@ -270,12 +277,12 @@ namespace Antmicro.Renode.Utilities.Binding
             var throwExceptions = typeof(ExceptionKeeper).GetMethod(nameof(ExceptionKeeper.ThrowExceptions));
             var importType = importField.FieldType;
             var invoke = importType.GetMethod("Invoke");
-            Type[] paramTypes = invoke.GetParameters().Select(p => p.ParameterType).ToArray();
-            Type[] paramTypesWithWrappersType = new Type[] { wrappersType }.Concat(paramTypes).ToArray();
+            var paramTypes = invoke.GetParameters().Select(p => p.ParameterType).ToArray();
+            var paramTypesWithWrappersType = new Type[] { wrappersType }.Concat(paramTypes).ToArray();
             // We need skipVisibility to handle methods that have a protected or private type as a parameter or return value.
             // Interesting tidbit: this access check is only performed by .NET Framework, Mono and .NET Core allow it
             // without skipVisibility.
-            DynamicMethod method = new DynamicMethod(importField.Name, invoke.ReturnType, paramTypesWithWrappersType, wrappersType, skipVisibility: true);
+            var method = new DynamicMethod(importField.Name, invoke.ReturnType, paramTypesWithWrappersType, wrappersType, skipVisibility: true);
             var il = method.GetILGenerator();
 
             il.Emit(OpCodes.Ldarg_0); // wrappersType instance
@@ -297,13 +304,13 @@ namespace Antmicro.Renode.Utilities.Binding
 
         private void ResolveCallsToNative(List<FieldInfo> importFields)
         {
-            classToBind.NoisyLog("Binding managed -> native calls.");
+            Logger.LogAs(classToBind, LogLevel.Noisy, "Binding managed -> native calls.");
 
             foreach(var field in importFields)
             {
                 var attribute = (ImportAttribute)field.GetCustomAttributes(false).First(x => x is ImportAttribute);
                 var cName = GetWrappedName(attribute.Name ?? GetCName(field.Name), attribute.UseExceptionWrapper);
-                classToBind.NoisyLog(string.Format("(NativeBinder) Binding {1} as {0}.", field.Name, cName));
+                Logger.LogAs(classToBind, LogLevel.Noisy, string.Format("(NativeBinder) Binding {1} as {0}.", field.Name, cName));
                 Delegate result = null;
                 try
                 {
@@ -344,8 +351,8 @@ namespace Antmicro.Renode.Utilities.Binding
             var addException = typeof(ExceptionKeeper).GetMethod(nameof(ExceptionKeeper.AddException));
             var nativeUnwind = classToBind.GetType().GetMethod(nameof(INativeUnwindable.NativeUnwind));
 
-            Type[] paramTypes = innerMethod.GetParameters().Select(p => p.ParameterType).ToArray();
-            Type[] paramTypesWithWrappersType = new Type[] { wrappersType }.Concat(paramTypes).ToArray();
+            var paramTypes = innerMethod.GetParameters().Select(p => p.ParameterType).ToArray();
+            var paramTypesWithWrappersType = new Type[] { wrappersType }.Concat(paramTypes).ToArray();
             // We need skipVisibility to be able to access superclass private methods.
             var attacheeWrapper = new DynamicMethod(innerMethod.Name + "Wrapper", innerMethod.ReturnType, paramTypesWithWrappersType, wrappersType, skipVisibility: true);
             var il = attacheeWrapper.GetILGenerator();
@@ -356,7 +363,7 @@ namespace Antmicro.Renode.Utilities.Binding
             }
             var exception = il.DeclareLocal(typeof(Exception));
 
-            Label @try = il.BeginExceptionBlock();
+            var @try = il.BeginExceptionBlock();
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldfld, instanceField);
             for(int i = 0; i < paramTypes.Length; ++i)
@@ -408,7 +415,7 @@ namespace Antmicro.Renode.Utilities.Binding
 
         private void ResolveCallsToManaged()
         {
-            classToBind.NoisyLog("Binding native -> managed calls.");
+            Logger.LogAs(classToBind, LogLevel.Noisy, "Binding native -> managed calls.");
             var symbols = SharedLibraries.GetAllSymbols(libraryFileName);
             var classMethods = classToBind.GetType().GetAllMethods().ToArray();
             var exportedMethods = new List<MethodInfo>();
@@ -421,7 +428,7 @@ namespace Antmicro.Renode.Utilities.Binding
                 var cName = parts[2];
                 var expectedTypeName = parts[1];
                 var csName = cName.StartsWith('$') ? GetCSharpName(cName.Substring(1)) : cName;
-                classToBind.NoisyLog("(NativeBinder) Binding {0} as {2} of type {1}.", cName, expectedTypeName, csName);
+                Logger.LogAs(classToBind, LogLevel.Noisy, "(NativeBinder) Binding {0} as {2} of type {1}.", cName, expectedTypeName, csName);
 
                 // let's find the desired method
                 var desiredMethodInfo = classMethods.FirstOrDefault(method =>
@@ -455,12 +462,6 @@ namespace Antmicro.Renode.Utilities.Binding
                     throw new InvalidOperationException($"Could not resolve call to managed: {e.Message}. Candidate is '{candidate}', desired method is '{desiredMethodInfo.ToString()}'");
                 }
 
-#if !PLATFORM_WINDOWS && !NET
-                // according to https://blogs.msdn.microsoft.com/cbrumme/2003/05/06/asynchronous-operations-pinning/,
-                // pinning is wrong (and it does not work on windows too)...
-                // but both on linux & osx it seems to be essential to avoid delegates from being relocated
-                handles = handles.Union(new [] { GCHandle.Alloc(attachee, GCHandleType.Pinned) }).ToArray();
-#endif
                 delegateStore = delegateStore.Union(new[] { attachee }).ToArray();
                 // let's make the attaching function delegate
                 var attacherType = DelegateTypeFromParamsAndReturn(new [] { delegateType }, typeof(void), $"Attach{delegateType.Name}");
@@ -473,7 +474,7 @@ namespace Antmicro.Renode.Utilities.Binding
             var notExportedMethods = classMethods.Where(x => x.IsDefined(typeof(ExportAttribute), true)).Except(exportedMethods);
             foreach(var method in notExportedMethods)
             {
-                classToBind.Log(LogLevel.Warning, "Method {0} is marked with Export attribute, but was not exported.", method.Name);
+                Logger.LogAs(classToBind, LogLevel.Warning, "Method {0} is marked with Export attribute, but was not exported.", method.Name);
             }
         }
 
@@ -489,10 +490,8 @@ namespace Antmicro.Renode.Utilities.Binding
 
         private IntPtr libraryAddress;
         private readonly string libraryFileName;
-        private readonly IEmulationElement classToBind;
+        private readonly object classToBind;
         private readonly object wrappersObj;
-#if !PLATFORM_WINDOWS && !NET
-        private GCHandle[] handles;
-#endif
+        private readonly ExceptionKeeper exceptionKeeper;
     }
 }

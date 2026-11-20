@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -14,10 +14,19 @@ namespace Antmicro.Renode.Peripherals.Bus.Wrappers
 {
     public sealed class WriteLoggingWrapper<T> : WriteHookWrapper<T>
     {
-        public WriteLoggingWrapper(IBusPeripheral peripheral, Action<long, T> originalMethod) : base(peripheral, originalMethod, null, null)
+        public WriteLoggingWrapper(PeripheralAccessMethods pam, Action<long, T> originalMethod) : base(pam, originalMethod, null, null)
         {
-            mapper = new RegisterMapper(peripheral.GetType());
-            machine = peripheral.GetMachine();
+            if(Peripheral is IHasMappedRegisters customMapperPeripheral)
+            {
+                // The peripheral might expose a proper mapper by itself
+                mapper = customMapperPeripheral.GetRegisterMapperForRegion(pam.Tag);
+            }
+            if(mapper is null)
+            {
+                // Otherwise, construct the dynamic mapper
+                mapper = new RegisterMapper(Peripheral.GetType(), pam.Tag);
+            }
+            machine = Peripheral.GetMachine();
         }
 
         public override void Write(long offset, T value)

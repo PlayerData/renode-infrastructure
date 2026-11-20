@@ -46,6 +46,98 @@ namespace Antmicro.Renode.UnitTests
         }
 
         [Test]
+        public void ShouldThrowBusAccessExceptionAtNonExistingDeviceWhenConfigured()
+        {
+            sysbus.UnhandledAccessBehaviour = UnhandledAccessBehaviour.ThrowException;
+
+            var readException = Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0xABCD1234));
+            var writeException = Assert.Throws<BusAccessException>(() => sysbus.WriteByte(0xABCD1234, 0));
+
+            Assert.AreEqual(BusAccessError.AddressError, readException.Error);
+            Assert.AreEqual(BusAccessError.AddressError, writeException.Error);
+        }
+
+        [Test]
+        public void ShouldThrowBusAccessExceptionAtNonExistingDeviceWhenConfiguredToThrowIfNotTagged()
+        {
+            sysbus.UnhandledAccessBehaviour = UnhandledAccessBehaviour.ThrowExceptionIfNotTagged;
+
+            var readException = Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0xABCD1234));
+            var writeException = Assert.Throws<BusAccessException>(() => sysbus.WriteByte(0xABCD1234, 0));
+
+            Assert.AreEqual(BusAccessError.AddressError, readException.Error);
+            Assert.AreEqual(BusAccessError.AddressError, writeException.Error);
+        }
+
+        [Test]
+        public void ShouldNotThrowBusAccessExceptionAtTaggedDeviceWhenConfiguredToThrowIfNotTagged()
+        {
+            const ulong defaultValue = 0x42;
+            sysbus.UnhandledAccessBehaviour = UnhandledAccessBehaviour.ThrowExceptionIfNotTagged;
+            sysbus.Tag(0xABCD1200.By(0x100), "tag", defaultValue);
+
+            Assert.DoesNotThrow(() => sysbus.WriteByte(0xABCD1234, 0));
+            Assert.AreEqual(defaultValue, sysbus.ReadByte(0xABCD1234));
+        }
+
+        [Test]
+        public void ShouldThrowBusAccessExceptionOnAccessToTagWithThrowException()
+        {
+            sysbus.Tag(0x1000.By(0x100), "tag", throwException: true);
+
+            var readException = Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0x1000));
+            var writeException = Assert.Throws<BusAccessException>(() => sysbus.WriteByte(0x1000, 0));
+
+            Assert.AreEqual(BusAccessError.AddressError, readException.Error);
+            Assert.AreEqual(BusAccessError.AddressError, writeException.Error);
+        }
+
+        [Test]
+        public void ShouldNotThrowBusAccessExceptionOnAccessToTagWithoutThrowException()
+        {
+            const ulong defaultValue = 0x42;
+            sysbus.Tag(0x1000.By(0x100), "tag", defaultValue);
+
+            Assert.DoesNotThrow(() => sysbus.WriteByte(0x1000, 0));
+            Assert.AreEqual(defaultValue, sysbus.ReadByte(0x1000));
+        }
+
+        [Test]
+        public void ShouldThrowBusAccessExceptionOnAccessToTagWithThrowExceptionEvenWhenReportingIsDisabled()
+        {
+            sysbus.UnhandledAccessBehaviour = UnhandledAccessBehaviour.DoNotReport;
+            sysbus.Tag(0x1000.By(0x100), "tag", throwException: true);
+
+            var readException = Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0x1000));
+            var writeException = Assert.Throws<BusAccessException>(() => sysbus.WriteByte(0x1000, 0));
+
+            Assert.AreEqual(BusAccessError.AddressError, readException.Error);
+            Assert.AreEqual(BusAccessError.AddressError, writeException.Error);
+        }
+
+        [Test]
+        public void ShouldPreserveThrowExceptionWhenSplittingTag()
+        {
+            sysbus.Tag(0x1000.By(0x100), "parent", throwException: true);
+            sysbus.Tag(0x1010.By(0x10), "child");
+
+            Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0x1000));
+            Assert.DoesNotThrow(() => sysbus.ReadByte(0x1010));
+            Assert.Throws<BusAccessException>(() => sysbus.ReadByte(0x10F0));
+        }
+
+        [Test]
+        public void ShouldPropagateBusAccessExceptionFromPeripheral()
+        {
+            var expectedException = new BusAccessException(BusAccessError.CommandError);
+            var peripheral = new Mock<IDoubleWordPeripheral>();
+            peripheral.Setup(x => x.ReadDoubleWord(0)).Throws(expectedException);
+            sysbus.Register(peripheral.Object, 0x1000.By(0x100));
+
+            Assert.AreSame(expectedException, Assert.Throws<BusAccessException>(() => sysbus.ReadDoubleWord(0x1000)));
+        }
+
+        [Test]
         public void ShouldFindAfterRegistration()
         {
             var peripheral = new Mock<IDoubleWordPeripheral>();
@@ -403,6 +495,26 @@ namespace Antmicro.Renode.UnitTests
             var machine = new Machine();
             var cpu = new EmptyCPU(machine);
             Assert.Throws(typeof(RegistrationException), () => machine.SystemBus.Register(cpu, null));
+        }
+
+        [Test]
+        public void ShouldFindBytePattern()
+        {
+            // FindBytes internal buffer size
+            const ulong bufferSize = 1 << 20;
+
+            // Register 2 separate memories to test pattern spanning 2 memories
+            var memory1 = new MappedMemory(sysbus.Machine, (long)bufferSize);
+            sysbus.Register(memory1, 0);
+            var memory2 = new MappedMemory(sysbus.Machine, (long)bufferSize);
+            sysbus.Register(memory2, bufferSize.By(bufferSize));
+
+            // Write the pattern at 2 locations, including buffer boundary
+            sysbus.WriteBytes(bytes, 0);
+            sysbus.WriteBytes(bytes, bufferSize - 4);
+
+            var addresses = sysbus.FindBytes(bytes);
+            Assert.AreEqual(new ulong[] { 0x0, bufferSize - 4 }, addresses);
         }
 
         private void CreateMachineAndExecute(Action<IBusController> action)

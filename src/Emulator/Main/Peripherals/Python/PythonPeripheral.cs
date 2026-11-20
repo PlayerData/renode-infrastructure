@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -11,7 +11,6 @@ using System.IO;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals.Bus;
-using Antmicro.Renode.UserInterface;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Python
@@ -39,7 +38,6 @@ namespace Antmicro.Renode.Peripherals.Python
         }
     }
 
-    [Icon("python")]
     public class PythonPeripheral : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IQuadWordPeripheral, IKnownSize, IAbsoluteAddressAware
     {
         public PythonPeripheral(int size, bool initable = false, string script = null, string filename = null)
@@ -55,7 +53,14 @@ namespace Antmicro.Renode.Peripherals.Python
             }
             if(this.script != null)
             {
-                this.pythonRunner = new PeripheralPythonEngine(this, x => x.CreateScriptSourceFromString(this.script));
+                try
+                {
+                    this.pythonRunner = new PeripheralPythonEngine(this, x => x.CreateScriptSourceFromString(this.script));
+                }
+                catch(RecoverableException e)
+                {
+                    throw new ConstructionException($"Error encountered when parsing Python peripheral script.", e);
+                }
             }
             else if(this.filename != null)
             {

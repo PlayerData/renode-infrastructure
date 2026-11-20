@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2023 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -23,6 +23,7 @@ namespace Antmicro.Renode
         static Emulator()
         {
             UserDirectoryPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData, Environment.SpecialFolderOption.Create), "renode");
+            exitLock = new object();
         }
 
         public static void ExecuteOnMainThread(Action what)
@@ -44,24 +45,53 @@ namespace Antmicro.Renode
             actionsOnMainThread.CompleteAdding();
         }
 
+        public static void RegisterCleanUp(Action handler)
+        {
+            if(handler == null)
+            {
+                return;
+            }
+
+            lock(exitLock)
+            {
+                if(exitEvent.IsSet)
+                {
+                    // The cleanup callback is registered after
+                    // emulator exited, so execute its callback immediately
+                    handler();
+                    return;
+                }
+
+                CleanUp += handler;
+            }
+        }
+
         public static void Exit()
         {
-            var beforeExit = BeforeExit;
-            if(beforeExit != null)
+            // Don't wait for an exit already in progress.
+            // We don't use the exitEvent because it has to be checked inside a lock, historically leading to deadlocks on UI quitting.
+            if(Interlocked.Exchange(ref exiting, 1) == 1)
             {
-                try
-                {
-                    beforeExit();
-                }
-                catch(RecoverableException)
-                {
-                    // Due to a complex bug, such exception is thrown on each exit if GUI was started.
-                    // All OSs are affected, but only Windows logs it. As it looks like a crash and
-                    // Linux/macOS seem to just silence those exceptions anyway, explicit silencing
-                    // seems best for all of them until the real fix is introduced.
-                }
+                return;
             }
-            exitEvent.Set();
+            lock(exitLock)
+            {
+                if(CleanUp != null)
+                {
+                    try
+                    {
+                        CleanUp();
+                    }
+                    catch(RecoverableException)
+                    {
+                        // Due to a complex bug, such exception is thrown on each exit if GUI was started.
+                        // All OSs are affected, but only Windows logs it. As it looks like a crash and
+                        // Linux/macOS seem to just silence those exceptions anyway, explicit silencing
+                        // seems best for all of them until the real fix is introduced.
+                    }
+                }
+                exitEvent.Set();
+            }
         }
 
         public static void OpenGUI()
@@ -142,14 +172,17 @@ namespace Antmicro.Renode
 
         private static readonly BlockingCollection<Action> actionsOnMainThread = new BlockingCollection<Action>();
 
-        public static event Action BeforeExit;
-
         public static event Action EnableGUI;
 
         public static event Action DisableGUI;
 
         private static IUserInterfaceProvider userInterfaceProvider;
+        private static readonly object exitLock;
         private static readonly ManualResetEventSlim exitEvent = new ManualResetEventSlim();
+        private static int exiting;
+
+        private static event Action CleanUp;
+
         private static bool disposed;
     }
 }

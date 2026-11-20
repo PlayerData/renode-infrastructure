@@ -5,7 +5,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
-using System;
+using System.Diagnostics;
 using System.Linq;
 
 using Antmicro.Renode.Core;
@@ -13,6 +13,7 @@ using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Bus.Wrappers;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Time;
 
@@ -63,7 +64,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             DefineRegisters();
         }
 
-        [ConnectionRegionAttribute("interruptVector")]
+        [ConnectionRegion("interruptVector")]
         public void WriteWordToInterruptVector(long offset, ushort value)
         {
             if(offset != 0)
@@ -74,7 +75,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             WriteWord((long)Registers.InterruptVector, value);
         }
 
-        [ConnectionRegionAttribute("interruptVector")]
+        [ConnectionRegion("interruptVector")]
         public ushort ReadWordFromInterruptVector(long offset)
         {
             if(offset != 0)
@@ -162,7 +163,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 mainTimer.Limit = timerCompare[0].Value;
                 break;
             default:
-                throw new Exception("unreachable");
+                throw new UnreachableException();
             }
 
             mainTimer.Enabled = true;
@@ -360,6 +361,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             UpDown,
         }
 
+        [RegistersDescription]
         private enum Registers
         {
             Control = 0x00,

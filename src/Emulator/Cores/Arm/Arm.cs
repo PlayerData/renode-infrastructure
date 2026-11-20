@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -15,7 +15,6 @@ using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Miscellaneous;
-using Antmicro.Renode.Peripherals.UART;
 using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Utilities.Binding;
 
@@ -24,7 +23,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 namespace Antmicro.Renode.Peripherals.CPU
 {
     [GPIO(NumberOfInputs = 2)]
-    public abstract partial class Arm : TranslationCPU, ICPUWithHooks, IRegisterablePeripheral<SemihostingUart, NullRegistrationPoint>, IRegisterablePeripheral<ArmPerformanceMonitoringUnit, NullRegistrationPoint>
+    public abstract partial class Arm : TranslationCPU, ICPUWithHooks, IRegisterablePeripheral<SemihostingHandler, NullRegistrationPoint>, IRegisterablePeripheral<ArmPerformanceMonitoringUnit, NullRegistrationPoint>, ICPUWithDirtyAdressesSharing
     {
         public Arm(string cpuType, IMachine machine, uint cpuId = 0, Endianess endianness = Endianess.LittleEndian, uint? numberOfMPURegions = null, ArmSignalsUnit signalsUnit = null)
             : base(cpuId, cpuType, machine, endianness)
@@ -79,13 +78,20 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibSetSevOnPending(value ? 1 : 0);
         }
 
-        public void SetEventFlag(bool value)
+        public void SetEventFlag()
         {
-            TlibSetEventFlag(value ? 1 : 0);
+            TlibSetEventFlag();
+        }
+
+        public override void Dispose()
+        {
+            semihostingHandler?.Dispose();
+            base.Dispose();
         }
 
         public override void Reset()
         {
+            semihostingHandler?.Reset();
             base.Reset();
             foreach(var config in defaultTCMConfiguration)
             {
@@ -124,19 +130,20 @@ namespace Antmicro.Renode.Peripherals.CPU
             return itState;
         }
 
-        public void Register(SemihostingUart peripheral, NullRegistrationPoint registrationPoint)
+        public void Register(SemihostingHandler peripheral, NullRegistrationPoint registrationPoint)
         {
-            if(semihostingUart != null)
+            if(semihostingHandler != null)
             {
-                throw new RegistrationException("A semihosting uart is already registered.");
+                throw new RegistrationException("A semihosting handler is already registered.");
             }
-            semihostingUart = peripheral;
+            semihostingHandler = peripheral;
+            semihostingHandler.AttachCpu(this);
             machine.RegisterAsAChildOf(this, peripheral, registrationPoint);
         }
 
-        public void Unregister(SemihostingUart peripheral)
+        public void Unregister(SemihostingHandler peripheral)
         {
-            semihostingUart = null;
+            semihostingHandler = null;
             machine.UnregisterAsAChildOf(this, peripheral);
         }
 
@@ -162,6 +169,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             return TlibGetArmFeature((int)feature) > 0;
         }
+
+        public bool IsSemihostingEnabled { get; set; } = true;
 
         public virtual uint ExceptionVectorAddress
         {
@@ -253,7 +262,51 @@ namespace Antmicro.Renode.Peripherals.CPU
         //gdb does not contain arm-m and armv7 as independent architecteures so we need to pass "arm" in every case.
         public override string GDBArchitecture { get { return "arm"; } }
 
-        public override List<GDBFeatureDescriptor> GDBFeatures { get { return new List<GDBFeatureDescriptor>(); } }
+        public override List<GDBFeatureDescriptor> GDBFeatures
+        {
+            get
+            {
+                var hasVfp = GetArmFeature(ArmFeatures.ARM_FEATURE_VFP);
+                var hasVfp3 = GetArmFeature(ArmFeatures.ARM_FEATURE_VFP3);
+                var hasNeon = GetArmFeature(ArmFeatures.ARM_FEATURE_NEON);
+
+                var features = new List<GDBFeatureDescriptor>();
+
+                var coreFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.core");
+                for(var index = 0u; index <= 12; index++)
+                {
+                    coreFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.R0 + index, 32, $"r{index}", "uint32", "general"));
+                }
+                coreFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.SP, 32, "sp", "data_ptr", "general"));
+                coreFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.LR, 32, "lr", "code_ptr", "general"));
+                coreFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.PC, 32, "pc", "code_ptr", "general"));
+                coreFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.CPSR, 32, "cpsr", "uint32", "general"));
+                features.Add(coreFeature);
+
+                if(hasVfp)
+                {
+                    var vfpFeature = new GDBFeatureDescriptor("org.gnu.gdb.arm.vfp");
+                    var endIndex = hasVfp3 ? 31 : 15;
+                    for(var index = 0u; index <= endIndex; index++)
+                    {
+                        vfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.D0 + index, 32, $"d{index}", "ieee_double", "float"));
+                    }
+
+                    vfpFeature.Registers.Add(new GDBRegisterDescriptor((uint)ArmRegisters.FPSCR, 32, "fpscr", "int", "float"));
+                    features.Add(vfpFeature);
+                }
+
+                if(hasNeon)
+                {
+                    // From G.5.4.7 NEON architecture feature:
+                    // The ‘org.gnu.gdb.arm.neon’ feature is optional. It does not need to contain registers; it instructs GDB to display the VFP double-precision
+                    // registers as vectors and to synthesize the quad-precision registers from pairs of double-precision registers.
+                    features.Add(new GDBFeatureDescriptor("org.gnu.gdb.arm.neon"));
+                }
+
+                return features;
+            }
+        }
 
         public bool ImplementsPMSA => MemorySystemArchitecture == MemorySystemArchitectureType.Physical_PMSA;
 
@@ -382,41 +435,24 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private uint DoSemihosting()
         {
-            var uart = semihostingUart;
-            //this.Log(LogLevel.Error, "Semihosing, r0={0:X}, r1={1:X} ({2:X})", this.GetRegister(0), this.GetRegister(1), this.TranslateAddress(this.GetRegister(1)));
-
-            uint operation = R[0];
-            uint r1 = R[1];
-            uint result = 0;
-            switch(operation)
+            if(!IsSemihostingEnabled)
             {
-            case 7: // SYS_READC
-                if(uart == null) break;
-                result = uart.SemihostingGetByte();
-                break;
-            case 3: // SYS_WRITEC
-            case 4: // SYS_WRITE0
-                if(uart == null) break;
-                string s = "";
-                if(!this.TryTranslateAddress(r1, MpuAccess.InstructionFetch, out var addr))
+                if(!warnedAboutSemihosting)
                 {
-                    this.Log(LogLevel.Debug, "Address translation failed when executing semihosting write operation for address: 0x{0:X}", r1);
-                    break;
+                    this.Log(LogLevel.Warning, "Intercepted semihosting call, but semihosting is disabled");
+                    warnedAboutSemihosting = true;
                 }
-                do
-                {
-                    var c = this.Bus.ReadByte(addr++);
-                    if(c == 0) break;
-                    s = s + Convert.ToChar(c);
-                    if((operation) == 3) break; // SYS_WRITEC
-                } while(true);
-                uart.SemihostingWriteString(s);
-                break;
-            default:
-                this.Log(LogLevel.Debug, "Unknown semihosting operation: 0x{0:X}", operation);
-                break;
+                return unchecked((uint)-1);
             }
-            return result;
+            if(semihostingHandler == null)
+            {
+                this.Log(LogLevel.Warning, "Semihosting handler is not registered; R0=0x{0:X} R1=0x{1:X}", (uint)R[0], (uint)R[1]);
+                return unchecked((uint)-1);
+            }
+            using(ObtainGenericPauseGuard())
+            {
+                return semihostingHandler.DoSemihosting(operationNumber: (uint)R[0], argumentsAddress: (uint)R[1]);
+            }
         }
 
         [Export]
@@ -432,13 +468,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
-        private void SetSystemEvent(int value)
+        private void SetSystemEvent()
         {
-            var flag = value != 0;
-
             foreach(var cpu in machine.SystemBus.GetCPUs().OfType<Arm>())
             {
-                cpu.SetEventFlag(flag);
+                cpu.SetEventFlag();
             }
         }
 
@@ -494,9 +528,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             performanceMonitoringUnit?.OnOverflowAction(counter);
         }
 
-        private ArmPerformanceMonitoringUnit performanceMonitoringUnit;
+        private SemihostingHandler semihostingHandler;
 
-        private SemihostingUart semihostingUart = null;
+        private ArmPerformanceMonitoringUnit performanceMonitoringUnit;
+        private bool warnedAboutSemihosting = false;
 
         // 649:  Field '...' is never assigned to, and will always have its default value null
 #pragma warning disable 649
@@ -521,7 +556,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint> TlibSetNumberOfMpuRegions;
 
         [Import]
-        private readonly Action<int> TlibSetEventFlag;
+        private readonly Action TlibSetEventFlag;
 
         [Import]
         private readonly Action<int> TlibSetThumb;

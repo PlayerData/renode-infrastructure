@@ -41,13 +41,14 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             binaryPointPosition = new SecurityBanked<int>();
             currentSevOnPending = new SecurityBanked<bool>();
             basepri = new SecurityBanked<byte>();
-            ccr = new SecurityBanked<uint>();
             irqs = new ExceptionSimpleArray<IRQState>();
             targetInterruptSecurityState = new InterruptTargetSecurityState[IRQCount];
+            interruptEnabled = new Dictionary<SystemException, bool>();
             IRQ = new GPIO();
             SystemResetRequest = new GPIO();
             InSleep = new GPIO();
             InDeepSleep = new GPIO();
+            Lockup = new GPIO();
             resetMachine = machine.RequestReset;
             systick = new SecurityBanked<SysTick>
             {
@@ -77,28 +78,43 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             return targetInterruptSecurityState[interruptNumber];
         }
 
+        /// <remarks>
+        /// NOTE: RFKXX is not respected here. `tlib_nvic_find_pending_irq()`
+        /// does not respect PRIMASK/BASEPRI/FAULTMASK.
+        /// </remarks>
+        public IEnumerable<int> GetPendingInterrupts()
+        {
+            lock(irqs)
+            {
+                return pendingIRQs.ToArray();
+            }
+        }
+
         public int? FindPendingInterrupt()
         {
             lock(irqs)
             {
-                var bestPriority = 0xFF + 1;
                 var preemptNeeded = activeIRQs.Count != 0;
                 int? result = null;
 
                 foreach(int i in pendingIRQs)
                 {
+                    if(isLockedUp && i != (int)SystemException.NMI)
+                    {
+                        continue;
+                    }
                     var currentIRQ = irqs[i];
-                    if(IsCandidate(currentIRQ, i) && AdjustPriority(i) < bestPriority)
+                    // ComparePriorities() uses full priority, exception number,
+                    // and Security state when selecting between pending exceptions.
+                    if(IsCandidate(currentIRQ) && (result == null || DoesAPreemptB(i, result.Value)))
                     {
                         result = i;
-                        bestPriority = AdjustPriority(i);
                     }
                 }
                 if(preemptNeeded && result != null)
                 {
                     var activeTop = activeIRQs.Peek();
-                    var activePriority = AdjustPriority(activeTop);
-                    if(!DoesAPreemptB(bestPriority, activePriority, !IsInterruptTargetNonSecure(result.Value), !IsInterruptTargetNonSecure(activeTop)))
+                    if(GetGroupPriority(result.Value) >= GetRawExecutionPriority())
                     {
                         result = null;
                     }
@@ -110,19 +126,21 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
                 if(result == null)
                 {
+                    IRQ.Set(false);
                     maskedInterruptPresent = false;
                     return null;
                 }
 
-                if(ShouldRaiseException(result.Value))
-                {
-                    IRQ.Set(true);
-                }
+                var groupPriority = GetGroupPriority(result.Value);
+                var canBecomeActive = groupPriority < GetExecutionPriority();
+                // WFI ignores PRIMASK, but it must still account for active
+                // exceptions, BASEPRI, and FAULTMASK (rule RHRMJ).
+                var canWakeFromWfi = groupPriority < GetExecutionPriority(ignorePrimask: true);
+                IRQ.Set(canBecomeActive);
+
                 // This field has side-effects, and can cause Cortex-M CPU running in another thread to exit WFI immediately.
-                // Make absolutely sure to execute last, after signaling IRQ handler to run with `IRQ.Set`.
-                // Only this way the CPU will enter an exception handler immediately upon waking from WFI.
-                // This doesn't matter for async (HW) interrupts, arriving when the core is executing normally.
-                maskedInterruptPresent = true;
+                // Make absolutely sure to execute last, after updating `IRQ`.
+                maskedInterruptPresent = canWakeFromWfi;
 
                 return result;
             }
@@ -180,38 +198,290 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        public void CompleteIRQ(int number)
+        public SynchronousFaultResult SetPendingSynchronousFault(int number)
+        {
+            lock(irqs)
+            {
+                this.NoisyLog("Synchronous fault {0}.", ExceptionToString(number));
+
+                if(!ShouldEscalateToHardFault(number, synchronous: true))
+                {
+                    SetPendingWithoutEscalation(number);
+                    FindPendingInterrupt();
+                    return SynchronousFaultResult.Pending;
+                }
+
+                var hardFault = GetEscalatedHardFault(number);
+                if(!CanSynchronousExceptionBecomeActive(hardFault))
+                {
+                    // Armv8-M ARM rule RXHMT and pseudocode operation CreateException:
+                    // instruction-time Lockup updates neither pending/active state nor HFSR.FORCED.
+                    this.DebugLog("Synchronous fault {0} cannot escalate to {1}, entering Lockup.",
+                        ExceptionToString(number), ExceptionToString(hardFault));
+                    return SynchronousFaultResult.Lockup;
+                }
+
+                this.DebugLog("Escalating IRQ {0} to HardFault.", ExceptionToString(number));
+                hardFaultForced = true;
+                SetPendingWithoutEscalation(hardFault);
+                FindPendingInterrupt();
+                return SynchronousFaultResult.Pending;
+            }
+        }
+
+        public SynchronousFaultResult SetPendingStackingFault(int number, int originalException)
+        {
+            lock(irqs)
+            {
+                // ExceptionEntry() performs PushStack() before ExceptionTaken().
+                // We acknowledged the original exception before stacking,
+                // so ignore the top active entry while reproducing the
+                // CreateException() decision at the point of the stack fault.
+                this.NoisyLog("Stacking fault {0} while entering {1}.",
+                    ExceptionToString(number), ExceptionToString(originalException));
+
+                var derivedException = number;
+                var escalated = ShouldEscalateStackingFault(number, originalException);
+                if(escalated)
+                {
+                    derivedException = GetEscalatedHardFault(number);
+                    if(!CanSynchronousExceptionBecomeActiveBeforeOriginal(derivedException, originalException))
+                    {
+                        // Rules RVKTX and RGJJG: the fault has updated its syndrome,
+                        // but creates no pending exception and does not set FORCED.
+                        this.DebugLog("Stacking fault {0} cannot escalate to {1}, entering Lockup.",
+                            ExceptionToString(number), ExceptionToString(derivedException));
+                        return SynchronousFaultResult.Lockup;
+                    }
+                }
+
+                if(escalated)
+                {
+                    hardFaultForced = true;
+                }
+
+                if(DoesAPreemptB(derivedException, originalException))
+                {
+                    // DerivedLateArrival(): the derived exception is taken using
+                    // the frame already allocated for the original exception.
+                    // Restore the original pending state which we cleared
+                    // during the early acknowledgement.
+                    RestoreAcknowledgedExceptionAsPending(originalException);
+                    SetPendingWithoutEscalation(derivedException);
+                    FindPendingInterrupt();
+                    return SynchronousFaultResult.Replaced;
+                }
+
+                // DerivedLateArrival() pends the derived exception even when
+                // it is the same exception as the original one. In that case
+                // the exception starts its handler Active+Pending.
+                SetPendingWithoutEscalation(derivedException);
+                FindPendingInterrupt();
+                return SynchronousFaultResult.Pending;
+            }
+        }
+
+        public SynchronousFaultResult SetPendingVectorFault(bool secure, int originalException, bool ignoreFaults)
+        {
+            lock(irqs)
+            {
+                // Armv8-M ARM rule RCTKP and pseudocode operation DerivedLateArrival:
+                // a terminal vector-table BusFault becomes HardFault with
+                // HFSR.VECTTBL set. We choose to have FORCED remain clear which is
+                // permitted on ARMv8.0-M and mandatory on ARMv8.1-M (RLLRP).
+                hardFaultVectorTable.Value = true;
+                if(ignoreFaults)
+                {
+                    // DerivedLateArrival() has already selected the original
+                    // exception with IgnoreFaults_ALL. Record only the syndrome.
+                    return SynchronousFaultResult.Ignored;
+                }
+
+                var hardFault = GetHardFaultForTargetSecurity(secure);
+                if(!CanSynchronousExceptionBecomeActive(hardFault))
+                {
+                    this.DebugLog("Vector-table HardFault {0} cannot become active, entering Lockup.",
+                        ExceptionToString(hardFault));
+                    return SynchronousFaultResult.Lockup;
+                }
+
+                // A terminal vector fault prevents the original exception
+                // from being taken. DerivedLateArrival() restores its pending
+                // state and enters HardFault using the existing frame.
+                RestoreAcknowledgedExceptionAsPending(originalException);
+                SetPendingWithoutEscalation(hardFault);
+                FindPendingInterrupt();
+                return SynchronousFaultResult.Replaced;
+            }
+        }
+
+        public uint GetFpccrReadyBits(int originalException, bool secure)
+        {
+            lock(irqs)
+            {
+                bool IsReady(int exception)
+                {
+                    return originalException != 0
+                        && activeIRQs.Count > 0
+                        && activeIRQs.Peek() == originalException
+                        ? CanSynchronousExceptionBecomeActiveBeforeOriginal(exception, originalException)
+                        : CanSynchronousExceptionBecomeActive(exception);
+                }
+
+                bool IsEnabledAndReady(int exception)
+                {
+                    return (!interruptEnabled.TryGetValue((SystemException)exception, out var enabled) || enabled)
+                        && IsReady(exception);
+                }
+
+                bool IsHardFaultReady()
+                {
+                    var ignoredActiveException = originalException != 0
+                        && activeIRQs.Count > 0
+                        && activeIRQs.Peek() == originalException
+                        ? originalException
+                        : (int?)null;
+                    return IsExecutionPriorityNonNegative(ignoredActiveException);
+                }
+
+                var result = 0u;
+                // UpdateFPCCR() defines HFRDY as ExecutionPriority() > -1,
+                // rather than as the readiness of either of the banked
+                // HardFaults. This matters for FAULTMASK_NS when BFHFNMINS is
+                // set, because HardFault is banked but the boosted execution
+                // priority is still -1.
+                BitHelper.SetBit(ref result, 4, IsHardFaultReady());
+                BitHelper.SetBit(ref result, 5, IsEnabledAndReady((int)(secure ? SystemException.MemManageFault_S : SystemException.MemManageFault)));
+                BitHelper.SetBit(ref result, 6, IsEnabledAndReady((int)SystemException.BusFault));
+                BitHelper.SetBit(ref result, 7, IsEnabledAndReady((int)SystemException.SecureFault));
+                // Architectural DebugMonitor state is not implemented, so
+                // CanPendMonitorOnEvent() is always false and MONRDY is zero.
+                BitHelper.SetBit(ref result, 10, IsEnabledAndReady((int)(secure ? SystemException.UsageFault_S : SystemException.UsageFault)));
+                return result;
+            }
+        }
+
+        public LazyFpFaultResult SetPendingLazyFpFault(int number, uint fpccr)
+        {
+            lock(irqs)
+            {
+                var architecturalNumber = number & ~BankedExcpSecureBit;
+                bool escalate;
+                switch((SystemException)architecturalNumber)
+                {
+                case SystemException.DebugMonitor:
+                    if(!BitHelper.IsBitSet(fpccr, 8))
+                    {
+                        return LazyFpFaultResult.Deferred;
+                    }
+                    escalate = false;
+                    break;
+                case SystemException.MemManageFault:
+                    escalate = !BitHelper.IsBitSet(fpccr, 5);
+                    break;
+                case SystemException.BusFault:
+                    escalate = !BitHelper.IsBitSet(fpccr, 6);
+                    break;
+                case SystemException.UsageFault:
+                    escalate = !BitHelper.IsBitSet(fpccr, 10);
+                    break;
+                case SystemException.SecureFault:
+                    escalate = !BitHelper.IsBitSet(fpccr, 7);
+                    break;
+                default:
+                    throw new ArgumentException($"Invalid lazy FP preservation fault: {number}");
+                }
+
+                var targetException = escalate ? GetEscalatedHardFault(number) : number;
+                var canPreemptNow = CanSynchronousExceptionBecomeActive(targetException);
+                if(!canPreemptNow && !BitHelper.IsBitSet(fpccr, 4))
+                {
+                    // Rule RRNKB and TakePreserveFPException(): Lockup uses
+                    // the saved HFRDY state and does not update FORCED or
+                    // pending/active exception state.
+                    return LazyFpFaultResult.Lockup;
+                }
+
+                if(escalate)
+                {
+                    hardFaultForced = true;
+                }
+                SetPendingWithoutEscalation(targetException);
+                FindPendingInterrupt();
+                return canPreemptNow ? LazyFpFaultResult.Taken : LazyFpFaultResult.Deferred;
+            }
+        }
+
+        public void EnterResetLockup(bool secure)
+        {
+            lock(irqs)
+            {
+                // Armv8-M ARM rule RBHVG and pseudocode operation TakeReset:
+                // a reset-vector BusFault makes the relevant HardFault active,
+                // clears its pending state, and enters Lockup with IPSR == 0.
+                hardFaultVectorTable.Value = true;
+                var hardFault = GetHardFaultForTargetSecurity(secure);
+                irqs[hardFault] |= IRQState.Active;
+                irqs[hardFault] &= ~IRQState.Pending;
+                pendingIRQs.Remove(hardFault);
+                activeIRQs.Push(hardFault);
+                FindPendingInterrupt();
+            }
+        }
+
+        public void SetLockupState(bool value)
+        {
+            lock(irqs)
+            {
+                isLockedUp = value;
+                Lockup.Set(value);
+                if(value)
+                {
+                    IRQ.Unset();
+                }
+                FindPendingInterrupt();
+            }
+        }
+
+        public bool CompleteIRQ(int number)
         {
             lock(irqs)
             {
                 var currentIRQ = irqs[number];
-                if((currentIRQ & IRQState.Active) == 0)
+                var isActive = (currentIRQ & IRQState.Active) != 0;
+                var isTopActive = activeIRQs.Count > 0 && activeIRQs.Peek() == number;
+                if(!isActive || !isTopActive)
                 {
-                    this.Log(LogLevel.Error, "Trying to complete not active IRQ {0}.", ExceptionToString(number));
-                    return;
+                    if(!isActive)
+                    {
+                        this.Log(LogLevel.Error, "Trying to complete not active IRQ {0}.", ExceptionToString(number));
+                    }
+                    else if(activeIRQs.Count == 0)
+                    {
+                        this.ErrorLog("Trying to complete IRQ {0}, but the active exception stack is empty.", ExceptionToString(number));
+                    }
+                    else
+                    {
+                        this.Log(LogLevel.Error, "Trying to complete IRQ {0} that was not the last active. Last active was {1}.", ExceptionToString(number), ExceptionToString(activeIRQs.Peek()));
+                    }
+
+                    // ValidateExceptionReturn() still calls DeActivate() when
+                    // corrupted return metadata selects an inactive exception.
+                    // DeActivate() clears the active fixed-priority exception
+                    // selected by RawExecutionPriority(), rather than trusting
+                    // the corrupted IPSR/EXC_RETURN Security-state selection.
+                    var fixedPriorityException = GetActiveFixedPriorityException();
+                    if(fixedPriorityException.HasValue)
+                    {
+                        DeactivateIRQ(fixedPriorityException.Value);
+                        FindPendingInterrupt();
+                    }
+                    return false;
                 }
-                irqs[number] &= ~IRQState.Active;
-                var activeIRQ = activeIRQs.Pop();
-                if(activeIRQ != number)
-                {
-                    this.Log(LogLevel.Error, "Trying to complete IRQ {0} that was not the last active. Last active was {1}.", ExceptionToString(number), ExceptionToString(activeIRQ));
-                    return;
-                }
-                if((currentIRQ & IRQState.Running) > 0)
-                {
-                    this.NoisyLog("Completed IRQ {0} active -> pending.", ExceptionToString(number));
-                    irqs[number] |= IRQState.Pending;
-                    pendingIRQs.Add(number);
-                }
-                else if((currentIRQ & IRQState.Pending) != 0)
-                {
-                    this.NoisyLog("Completed IRQ {0} active -> pending.", number);
-                }
-                else
-                {
-                    this.NoisyLog("Completed IRQ {0} active -> inactive.", ExceptionToString(number));
-                }
+
+                DeactivateIRQ(number);
                 FindPendingInterrupt();
+                return true;
             }
         }
 
@@ -307,6 +577,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 // Key is OK, allow access to go through
                 goto default;
             case Registers.ConfigurableFaultStatus:
+                if(!CanAccessNonBankedFaultState(isSecure))
+                {
+                    value &= ~BusFaultStatusMask;
+                }
                 if(isSecure || !cpu.TrustZoneEnabled)
                 {
                     cpu.FaultStatus &= ~value;
@@ -317,20 +591,32 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 break;
             case Registers.SystemHandlerPriority1:
-                // 7th interrupt is ignored
-                priorities[(int)(isSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault)] = (byte)value;
-                priorities[(int)SystemException.BusFault] = (byte)(value >> 8);
-                priorities[(int)(isSecure ? SystemException.UsageFault_S : SystemException.UsageFault)] = (byte)(value >> 16);
-                this.DebugLog("Priority of IRQs 4, 5, 6 set to 0x{0:X}, 0x{1:X}, 0x{2:X} respectively.", (byte)value, (byte)(value >> 8), (byte)(value >> 16));
+                lock(irqs)
+                {
+                    SetSystemHandlerPriority(SystemException.MemManageFault, (byte)value, isSecure);
+                    SetSystemHandlerPriority(SystemException.BusFault, (byte)(value >> 8), isSecure);
+                    SetSystemHandlerPriority(SystemException.UsageFault, (byte)(value >> 16), isSecure);
+                    SetSystemHandlerPriority(SystemException.SecureFault, (byte)(value >> 24), isSecure);
+                    FindPendingInterrupt();
+                }
+                this.DebugLog("Priority of IRQs 4, 5, 6, 7 set to 0x{0:X}, 0x{1:X}, 0x{2:X}, 0x{3:X} respectively.",
+                    (byte)value, (byte)(value >> 8), (byte)(value >> 16), (byte)(value >> 24));
                 break;
             case Registers.SystemHandlerPriority2:
-                // only 11th is not ignored
-                priorities[(int)(isSecure ? SystemException.SuperVisorCall_S : SystemException.SuperVisorCall)] = (byte)(value >> 24);
+                lock(irqs)
+                {
+                    SetSystemHandlerPriority(SystemException.SuperVisorCall, (byte)(value >> 24), isSecure);
+                    FindPendingInterrupt();
+                }
                 this.DebugLog("Priority of IRQ 11 set to 0x{0:X}.", (byte)(value >> 24));
                 break;
             case Registers.SystemHandlerPriority3:
-                priorities[(int)(isSecure ? SystemException.PendSV_S : SystemException.PendSV)] = (byte)(value >> 16);
-                priorities[(int)(isSecure ? SystemException.SysTick_S : SystemException.SysTick)] = (byte)(value >> 24);
+                lock(irqs)
+                {
+                    SetSystemHandlerPriority(SystemException.PendSV, (byte)(value >> 16), isSecure);
+                    SetSystemHandlerPriority(SystemException.SysTick, (byte)(value >> 24), isSecure);
+                    FindPendingInterrupt();
+                }
                 this.DebugLog("Priority of IRQs 14, 15 set to 0x{0:X}, 0x{1:X} respectively.", (byte)(value >> 16), (byte)(value >> 24));
                 break;
             case Registers.CoprocessorAccessControl:
@@ -355,9 +641,17 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     cpu.FpuEnabled = false;
                 }
                 break;
+            case Registers.NonsecureAccessControl:
+                if(!IsPrivilegedMode() || !isSecure)
+                {
+                    this.Log(LogLevel.Warning, "Writing to NonsecureAccessControl requires privileged and secure access.");
+                    break;
+                }
+                cpu.NSACR = value;
+                break;
             case Registers.SoftwareTriggerInterrupt:
                 // This register is implemented only in ARMv7m and ARMv8m
-                if(cpu.Model == "cortex-m3" || cpu.Model == "cortex-m4" || cpu.Model == "cortex-m4f" || cpu.Model == "cortex-m7")
+                if(cpu.ArchitectureVersion >= 7)
                 {
                     SetPendingIRQ((int)(16 + value));
                 }
@@ -393,7 +687,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 SetTrustZoneBankedRegisterValue(isSecure, (val) => cpu.FPDSCR = val, (val) => cpu.FPDSCR_NS = val, value & 0x07c00000);
                 break;
             case Registers.ConfigurationAndControl:
-                ccr.Get(isSecure) = value;
+                if(FilterCcrDiv0Write)
+                {
+                    if(BitHelper.IsBitSet(value, 4))
+                    {
+                        this.Log(LogLevel.Warning, "Writing to CCR.DIV_0_TRP, but FilterCcrDiv0Write is set. The field won't be updated.");
+                        BitHelper.SetBit(ref value, 4, false);
+                    }
+                }
+                SetTrustZoneBankedRegisterValue(isSecure, (val) => cpu.ConfigurationAndControlRegister = val, (val) => cpu.ConfigurationAndControlRegisterNonSecure = val, value);
                 break;
             default:
                 lock(RegisterCollection)
@@ -474,6 +776,13 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 return cpuId;
             case Registers.CoprocessorAccessControl:
                 return GetTrustZoneBankedRegisterValue(isSecure, () => cpu.CPACR, () => cpu.CPACR_NS);
+            case Registers.NonsecureAccessControl:
+                // This register is RAZ/WI in Non-secure state
+                if(!isSecure)
+                {
+                    return 0;
+                }
+                return cpu.NSACR;
             case Registers.FPContextControl:
                 if(!IsPrivilegedMode())
                 {
@@ -496,17 +805,20 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 return GetTrustZoneBankedRegisterValue(isSecure, () => cpu.FPDSCR, () => cpu.FPDSCR_NS);
             case Registers.ConfigurationAndControl:
-                return ccr.Get(isSecure);
+                return GetTrustZoneBankedRegisterValue(isSecure, () => cpu.ConfigurationAndControlRegister, () => cpu.ConfigurationAndControlRegisterNonSecure);
             case Registers.SystemHandlerPriority1:
             case Registers.SystemHandlerPriority2:
             case Registers.SystemHandlerPriority3:
                 return HandlePriorityRead(offset - 0xD14, false, isSecure);
             case Registers.ConfigurableFaultStatus:
-                return GetTrustZoneBankedRegisterValue(isSecure, () => cpu.FaultStatus, () => cpu.FaultStatusNonSecure);
+                var faultStatus = GetTrustZoneBankedRegisterValue(isSecure, () => cpu.FaultStatus, () => cpu.FaultStatusNonSecure);
+                return CanAccessNonBankedFaultState(isSecure) ? faultStatus : faultStatus & ~BusFaultStatusMask;
             case Registers.InterruptControllerType:
                 return 0b0111;
             case Registers.MemoryFaultAddress:
                 return GetTrustZoneBankedRegisterValue(isSecure, () => cpu.MemoryFaultAddress, () => cpu.MemoryFaultAddressNonSecure);
+            case Registers.BusFaultAddress:
+                return CanAccessNonBankedFaultState(isSecure) ? cpu.BusFaultAddress : 0;
             default:
                 lock(RegisterCollection)
                 {
@@ -539,15 +851,16 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             SystemResetRequest.Unset();
             InSleep.Unset();
             InDeepSleep.Unset();
+            Lockup.Unset();
+            isLockedUp = false;
             currentSevOnPending.Reset();
             mpuControlRegister = 0;
             HaltSystickOnDeepSleep = defaultHaltSystickOnDeepSleep;
             canResetOnlyFromSecure = false;
             deepSleepOnlyFromSecure = false;
             binaryPointPosition.Reset();
-
-            // bit [16] DC / Cache enable. This is a global enable bit for data and unified caches.
-            ccr.Reset(0x10000);
+            basepri.Reset();
+            hardFaultForced = false;
         }
 
         [ConnectionRegion("NonSecure")]
@@ -556,6 +869,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             if(!cpu.TrustZoneEnabled)
             {
                 throw new RecoverableException(TrustZoneNSRegionWarning);
+            }
+            if(offset == (long)Registers.DebugHaltingControlAndStatus)
+            {
+                // D1.2.39: DHCSR_NS is visible only to Secure software.
+                var isSecure = IsCurrentCPUInSecureState(out var currentCpu);
+                if(currentCpu == null || !isSecure)
+                {
+                    return 0;
+                }
             }
             return ReadDoubleWord(offset, false);
         }
@@ -592,6 +914,14 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             cpu.AddHookAtWfiStateChange(HandleWfiStateChange);
         }
 
+        public bool IsBFHFNMINSEnabled
+        {
+            get
+            {
+                return !cpu.TrustZoneEnabled || targetInterruptSecurityState[(int)SystemException.HardFault] == InterruptTargetSecurityState.NonSecure;
+            }
+        }
+
         [HideInMonitor]
         public byte BASEPRI_S
         {
@@ -601,11 +931,12 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 lock(irqs)
                 {
-                    if(value == basepri.SecureVal)
+                    var normalizedValue = (byte)(value & priorityMask);
+                    if(normalizedValue == basepri.SecureVal)
                     {
                         return;
                     }
-                    basepri.SecureVal = value;
+                    basepri.SecureVal = normalizedValue;
                     FindPendingInterrupt();
                 }
             }
@@ -620,11 +951,12 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 lock(irqs)
                 {
-                    if(value == basepri.NonSecureVal)
+                    var normalizedValue = (byte)(value & priorityMask);
+                    if(normalizedValue == basepri.NonSecureVal)
                     {
                         return;
                     }
-                    basepri.NonSecureVal = value;
+                    basepri.NonSecureVal = normalizedValue;
                     FindPendingInterrupt();
                 }
             }
@@ -652,7 +984,28 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        public bool Clocked
+        {
+            get => systick.NonSecureVal.Clocked;
+            set
+            {
+                // Propagate setting to both security banks.
+                systick.NonSecureVal.Clocked = value;
+                if(cpu.TrustZoneEnabled)
+                {
+                    systick.SecureVal.Clocked = value;
+                }
+            }
+        }
+
         public bool HaltSystickOnDeepSleep { get; set; }
+
+        /// <summary>
+        /// Blocks writes to CCR.DIV_0_TRP register field so CPU wouldn't fault on integer division by 0
+        /// </summary>
+        public bool FilterCcrDiv0Write { get; set; } = false;
+
+        public bool SysResetReq { get; set; } = false;
 
         [DefaultInterruptAttribute]
         public GPIO IRQ { get; private set; }
@@ -662,6 +1015,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         public GPIO InSleep { get; private set; }
 
         public GPIO InDeepSleep { get; private set; }
+
+        public GPIO Lockup { get; private set; }
 
         public long Size
         {
@@ -675,14 +1030,43 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool DeepSleepEnabled { get; set; }
 
+        public const uint STIROffset = (uint)Registers.SoftwareTriggerInterrupt;
+
         private static int GetStartingInterrupt(long offset, bool externalInterrupt)
         {
             return (int)(offset + (externalInterrupt ? 16 : 0));
         }
 
+        private static bool IsAnException(int interrupt)
+        {
+            return Enum.IsDefined(typeof(SystemException), interrupt);
+        }
+
+        private static bool IsSynchronousException(int interrupt)
+        {
+            if(IsAnException(interrupt))
+            {
+                var exception = (SystemException)interrupt;
+                switch(exception)
+                {
+                // These are the asynchronous system exceptions
+                // Taken from https://support.arm.com/documentation/107706/0100/Exceptions-and-interrupts-overview/Classification-of-synchronous-and-asynchronous-exceptions
+                case SystemException.NMI:
+                case SystemException.SysTick:
+                case SystemException.SysTick_S:
+                case SystemException.PendSV:
+                case SystemException.PendSV_S:
+                    return false;
+                default:
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private static string ExceptionToString(int exception)
         {
-            if(Enum.IsDefined(typeof(SystemException), exception))
+            if(IsAnException(exception))
             {
                 return ((SystemException)exception).ToString();
             }
@@ -694,13 +1078,17 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         {
             Registers.SysTickControl.Define(RegisterCollection)
                 .WithFlag(0,
-                    changeCallback: (_, value) => systick.Get(isNextAccessSecure).Enabled = value,
+                    writeCallback: (_, value) => systick.Get(isNextAccessSecure).Enabled = value,
                     valueProviderCallback: _ => systick.Get(isNextAccessSecure).Enabled,
                     name: "ENABLE")
                 .WithFlag(1,
                     valueProviderCallback: _ => systick.Get(isNextAccessSecure).TickInterruptEnabled,
-                    changeCallback: (_, newValue) =>
+                    writeCallback: (_, newValue) =>
                     {
+                        if(systick.Get(isNextAccessSecure).TickInterruptEnabled == newValue)
+                        {
+                            return;
+                        }
                         this.NoisyLog("Systick_{0} interrupt {1}", isNextAccessSecure ? "S" : "NS", newValue ? "enabled" : "disabled");
                         systick.Get(isNextAccessSecure).TickInterruptEnabled = newValue;
                     }, name: "TICKINT")
@@ -720,7 +1108,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             Registers.SysTickReloadValue.Define(RegisterCollection)
                 .WithValueField(0, 24,
                     valueProviderCallback: _ => systick.Get(isNextAccessSecure).Reload,
-                    changeCallback: (_, newValue) => systick.Get(isNextAccessSecure).Reload = newValue,
+                    writeCallback: (_, newValue) => systick.Get(isNextAccessSecure).Reload = newValue,
                     name: "RELOAD")
                 .WithReservedBits(24, 8);
 
@@ -744,7 +1132,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             Registers.InterruptControlState.Define(RegisterCollection)
                 .WithValueField(0, 9, FieldMode.Read, valueProviderCallback: _ => (uint)(activeIRQs.Count == 0 ? 0 : activeIRQs.Peek()), name: "VECTACTIVE")
                 .WithReservedBits(9, 2)
-                .WithTaggedFlag("RETTOBASE", 11)
+                .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => activeIRQs.Count() <= 1, name: "RETTOBASE")
                 .WithValueField(12, 9, FieldMode.Read, valueProviderCallback: _ => (ulong)(FindPendingInterrupt() ?? 0), name: "VECTPENDING")
                 .WithReservedBits(21, 1)
                 .WithTaggedFlag("ISRPENDING", 22)
@@ -763,7 +1151,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     {
                         SetPendingIRQ((int)(isNextAccessSecure ? SystemException.SysTick_S : SystemException.SysTick));
                     }
-                }, valueProviderCallback: _ => irqs[(int)SystemException.SysTick].HasFlag(IRQState.Pending), name: "PENDSTSET")
+                }, valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.SysTick_S : SystemException.SysTick)].HasFlag(IRQState.Pending), name: "PENDSTSET")
                 .WithFlag(27, FieldMode.WriteOneToClear, writeCallback: (_, value) =>
                 {
                     if(value)
@@ -777,7 +1165,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     {
                         SetPendingIRQ((int)(isNextAccessSecure ? SystemException.PendSV_S : SystemException.PendSV));
                     }
-                }, valueProviderCallback: _ => irqs[(int)SystemException.PendSV].HasFlag(IRQState.Pending), name: "PENDSVSET")
+                }, valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.PendSV_S : SystemException.PendSV)].HasFlag(IRQState.Pending), name: "PENDSVSET")
                 .WithReservedBits(29, 1)
                 .WithFlag(30, FieldMode.WriteOneToClear, writeCallback: (_, value) =>
                 {
@@ -835,10 +1223,13 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     },
                     name: "SLEEPDEEPS")
                 .WithFlag(4,
-                    changeCallback: (_, value) =>
+                    writeCallback: (_, value) =>
                     {
-                        SetSevOnPendingOnAllCPUs(value);
-                        currentSevOnPending.Get(isNextAccessSecure) = value;
+                        if(currentSevOnPending.Get(isNextAccessSecure) != value)
+                        {
+                            SetSevOnPendingOnAllCPUs(value);
+                            currentSevOnPending.Get(isNextAccessSecure) = value;
+                        }
                     },
                     valueProviderCallback: _ => currentSevOnPending.Get(isNextAccessSecure),
                     name: "SEVONPEND")
@@ -864,6 +1255,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                             return;
                         }
                         /* Handle the reset immediately if we don't expect some action from e.g. SystemC side */
+                        SysResetReq = true;
                         if(PauseInsteadOfReset)
                         {
                             machine.Pause();
@@ -896,7 +1288,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 .WithReservedBits(6, 2)
                 .WithValueField(8, 3, writeCallback: (_, value) =>
                 {
-                    binaryPointPosition.Get(isNextAccessSecure) = (int)value;
+                    if(binaryPointPosition.Get(isNextAccessSecure) != (int)value)
+                    {
+                        binaryPointPosition.Get(isNextAccessSecure) = (int)value;
+                        FindPendingInterrupt();
+                    }
                 }, name: "PRIGROUP")
                 .WithReservedBits(11, 2)
                 .WithFlag(13, writeCallback: (_, value) =>
@@ -911,7 +1307,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     {
                         targetInterruptSecurityState[(int)excp] = sec;
                     }
-                }, name: "BFHFNMINS")
+                    FindPendingInterrupt();
+                },
+                valueProviderCallback: _ => IsBFHFNMINSEnabled,
+                name: "BFHFNMINS")
                 .WithFlag(14, writeCallback: (_, value) =>
                 {
                     if(!isNextAccessSecure)
@@ -919,7 +1318,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                         // This bit is RAZ/WI from Non-secure state.
                         return;
                     }
-                    prioritizeSecureInterrupts = value;
+                    if(prioritizeSecureInterrupts != value)
+                    {
+                        prioritizeSecureInterrupts = value;
+                        FindPendingInterrupt();
+                    }
                 }, valueProviderCallback: _ =>
                 {
                     if(!isNextAccessSecure)
@@ -934,46 +1337,414 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 .WithValueField(16, 16, valueProviderCallback: _ => VectKeyStat, name: "VECTKEYSTAT");
 
             Registers.SystemHandlerControlAndState.Define(RegisterCollection)
-                .WithTaggedFlag("MEMFAULTACT (Memory Manage Active)", 0)
-                .WithTaggedFlag("BUSFAULTACT (Bus Fault Active)", 1)
-                .WithReservedBits(2, 1)
-                .WithTaggedFlag("USGFAULTACT (Usage Fault Active)", 3)
-                .WithReservedBits(4, 3)
-                .WithTaggedFlag("SVCALLACT (SV Call Active)", 7)
+                .WithFlag(0,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault;
+                        if(value)
+                        {
+                            irqs[(int)bank] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)bank] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault)].HasFlag(IRQState.Active),
+                    name: "MEMFAULTACT (Memory Manage Active)")
+                .WithFlag(1,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return;
+                        }
+                        if(value)
+                        {
+                            irqs[(int)SystemException.BusFault] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)SystemException.BusFault] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return false;
+                        }
+                        return irqs[(int)SystemException.BusFault].HasFlag(IRQState.Active);
+                    },
+                    name: "BUSFAULTACT (Bus Fault Active)")
+                .WithFlag(2,
+                    writeCallback: (_, value) =>
+                    {
+                        // Only allow write from Secure state or from monitor
+                        var isAccessAllowed = IsCurrentCPUInSecureState(out var currentCpu) || currentCpu == null;
+                        if(isNextAccessSecure || !isAccessAllowed)
+                        {
+                            // Can't modify Secure version of this register
+                            return;
+                        }
+
+                        if(!value)
+                        {
+                            irqs[(int)SystemException.HardFault] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // If HardFault is not Non-secure enabled this field will just be 0
+                            return false;
+                        }
+                        return irqs[(int)(isNextAccessSecure ^ IsBFHFNMINSEnabled ? SystemException.HardFault : SystemException.HardFault_S)].HasFlag(IRQState.Active);
+                    },
+                    name: "HARDFAULTACT (Hard Fault Active)")
+                .WithFlag(3,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault;
+                        if(value)
+                        {
+                            irqs[(int)bank] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)bank] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault)].HasFlag(IRQState.Active),
+                    name: "USGFAULTACT (Usage Fault Active)")
+                .WithFlag(4,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state
+                            return;
+                        }
+                        if(value)
+                        {
+                            irqs[(int)SystemException.SecureFault] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)SystemException.SecureFault] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state
+                            return false;
+                        }
+                        return irqs[(int)SystemException.SecureFault].HasFlag(IRQState.Active);
+                    },
+                    name: "SECUREFAULTACT (Secure Fault Active)")
+                .WithFlag(5,
+                    writeCallback: (_, value) =>
+                    {
+                        var isAccessAllowed = IsCurrentCPUInSecureState(out var currentCpu) || currentCpu == null;
+                        if(isNextAccessSecure || !isAccessAllowed || !IsBFHFNMINSEnabled)
+                        {
+                            return;
+                        }
+                        if(!value)
+                        {
+                            irqs[(int)SystemException.NMI] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if NMI targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return false;
+                        }
+                        return irqs[(int)SystemException.NMI].HasFlag(IRQState.Active);
+                    },
+                    name: "NMIACT (NMI Exception Active)")
+                .WithReservedBits(6, 1)
+                .WithFlag(7,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.SuperVisorCall_S : SystemException.SuperVisorCall;
+                        if(value)
+                        {
+                            irqs[(int)bank] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)bank] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.SuperVisorCall_S : SystemException.SuperVisorCall)].HasFlag(IRQState.Active),
+                    name: "SVCALLACT (SV Call Active)")
                 .WithTaggedFlag("MONITORACT (Monitor Active)", 8)
                 .WithReservedBits(9, 1)
-                .WithTaggedFlag("PENDSVACT (Pend SV Active)", 10)
-                .WithTaggedFlag("SYSTICKACT (Sys Tick Active)", 11)
-                .WithTaggedFlag("USGFAULTPENDED (Usage Fault Pending)", 12)
-                .WithTaggedFlag("MEMFAULTPENDED (Mem Manage Pending)", 13)
-                .WithTaggedFlag("BUSFAULTPENDED (Bus Fault Pending)", 14)
-                .WithTaggedFlag("SVCALLPENDED (SV Call Pending)", 15)
-                // The enable flags only store written data.
-                // Changing them doesn't change a behavior of the model.
-                .WithFlag(16, name: "MEMFAULTENA (Memory Manage Fault Enable)")
-                .WithFlag(17, name: "BUSFAULTENA (Bus Fault Enable)")
-                .WithFlag(18, name: "USGFAULTENA (Usage Fault Enable)")
-                .WithReservedBits(19, 13)
-                .WithChangeCallback((_, val) =>
+                .WithFlag(10,
+                    writeCallback: (_, value) =>
                     {
-                        // Don't warn about implemented fields.
-                        if(val != BitHelper.Bits(16, 3))
+                        var bank = isNextAccessSecure ? SystemException.PendSV_S : SystemException.PendSV;
+                        if(value)
                         {
-                            this.Log(LogLevel.Warning, "Changing value of the SHCSR register to 0x{0:X}, but only bits [16:18] are supported", val);
+                            irqs[(int)bank] |= IRQState.Active;
                         }
-                    }
-                );
+                        else
+                        {
+                            irqs[(int)bank] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.PendSV_S : SystemException.PendSV)].HasFlag(IRQState.Active),
+                    name: "PENDSVACT (Pend SV Active)")
+                .WithFlag(11,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.SysTick_S : SystemException.SysTick;
+                        if(value)
+                        {
+                            irqs[(int)bank] |= IRQState.Active;
+                        }
+                        else
+                        {
+                            irqs[(int)bank] &= ~IRQState.Active;
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.SysTick_S : SystemException.SysTick)].HasFlag(IRQState.Active),
+                    name: "SYSTICKACT (Sys Tick Active)")
+                .WithFlag(12,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault;
+                        if(value)
+                        {
+                            SetPendingIRQ((int)bank);
+                        }
+                        else
+                        {
+                            ClearPending((int)bank);
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault)].HasFlag(IRQState.Pending),
+                    name: "USGFAULTPENDED (Usage Fault Pending)")
+                .WithFlag(13,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault;
+                        if(value)
+                        {
+                            SetPendingIRQ((int)bank);
+                        }
+                        else
+                        {
+                            ClearPending((int)bank);
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault)].HasFlag(IRQState.Pending),
+                    name: "MEMFAULTPENDED (Mem Manage Pending)")
+                .WithFlag(14,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return;
+                        }
+                        if(value)
+                        {
+                            SetPendingIRQ((int)SystemException.BusFault);
+                        }
+                        else
+                        {
+                            ClearPending((int)SystemException.BusFault);
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return false;
+                        }
+                        return irqs[(int)SystemException.BusFault].HasFlag(IRQState.Pending);
+                    },
+                    name: "BUSFAULTPENDED (Bus Fault Pending)")
+                .WithFlag(15,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.SuperVisorCall_S : SystemException.SuperVisorCall;
+                        if(value)
+                        {
+                            SetPendingIRQ((int)bank);
+                        }
+                        else
+                        {
+                            ClearPending((int)bank);
+                        }
+                    },
+                    valueProviderCallback: _ => irqs[(int)(isNextAccessSecure ? SystemException.SuperVisorCall_S : SystemException.SuperVisorCall)].HasFlag(IRQState.Pending),
+                    name: "SVCALLPENDED (SV Call Pending)")
+                .WithFlag(16,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault;
+                        interruptEnabled[bank] = value;
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.MemManageFault_S : SystemException.MemManageFault;
+                        return interruptEnabled[bank];
+                    },
+                    name: "MEMFAULTENA (Memory Manage Fault Enable)")
+                .WithFlag(17,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state
+                            return;
+                        }
+                        interruptEnabled[SystemException.BusFault] = value;
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state
+                            return false;
+                        }
+                        return interruptEnabled[SystemException.BusFault];
+                    }, name: "BUSFAULTENA (Bus Fault Enable)")
+                .WithFlag(18,
+                    writeCallback: (_, value) =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault;
+                        interruptEnabled[bank] = value;
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        var bank = isNextAccessSecure ? SystemException.UsageFault_S : SystemException.UsageFault;
+                        return interruptEnabled[bank];
+                    },
+                    name: "USGFAULTENA (Usage Fault Enable)")
+                .WithFlag(19,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state.
+                            return;
+                        }
+                        interruptEnabled[SystemException.SecureFault] = value;
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state.
+                            return false;
+                        }
+                        return interruptEnabled[SystemException.SecureFault];
+                    },
+                    name: "SECUREFAULTENA (Secure Fault Enable)")
+                .WithFlag(20,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return;
+                        }
+                        if(value)
+                        {
+                            SetPendingIRQ((int)SystemException.SecureFault);
+                        }
+                        else
+                        {
+                            ClearPending((int)SystemException.SecureFault);
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if BusFault targets Secure state (AIRCR.BFHFNMINS is zero)
+                            return false;
+                        }
+                        return irqs[(int)SystemException.SecureFault].HasFlag(IRQState.Pending);
+                    },
+                    name: "SECUREFAULTPENDED (Secure Fault Pending)")
+                .WithFlag(21,
+                    writeCallback: (_, value) =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if HardFault can't target Non-secure state (AIRCR.BFHFNMINS is zero)
+                            return;
+                        }
+                        // For Secure-state use normal HardFault if Non-secure exception is disabled, and use secure one if it's enabled
+                        var bank = isNextAccessSecure ^ IsBFHFNMINSEnabled ? SystemException.HardFault : SystemException.HardFault_S;
+
+                        if(value)
+                        {
+                            SetPendingIRQ((int)bank);
+                        }
+                        else
+                        {
+                            ClearPending((int)bank);
+                        }
+                    },
+                    valueProviderCallback: _ =>
+                    {
+                        if(!isNextAccessSecure && !IsBFHFNMINSEnabled)
+                        {
+                            // This bit is RAZ/WI from Non-secure state if HardFault can't target Non-secure state (AIRCR.BFHFNMINS is zero)
+                            return false;
+                        }
+                        return irqs[(int)(isNextAccessSecure ^ IsBFHFNMINSEnabled ? SystemException.HardFault : SystemException.HardFault_S)].HasFlag(IRQState.Pending);
+                    },
+                    name: "HARDFAULTPENDED (Hard Fault Pending)")
+                .WithReservedBits(22, 10);
 
             Registers.HardFaultStatus.Define(RegisterCollection)
                 .WithReservedBits(0, 1)
-                .WithTaggedFlag("VECTTBL", 1)
+                .WithFlag(1, out hardFaultVectorTable, FieldMode.Read | FieldMode.WriteOneToClear, name: "VECTTBL")
                 .WithReservedBits(2, 28)
-                .WithTaggedFlag("FORCED", 30)
+                .WithFlag(30, FieldMode.Read | FieldMode.WriteOneToClear,
+                    writeCallback: (_, value) =>
+                    {
+                        if(value && CanAccessNonBankedFaultState(isNextAccessSecure))
+                        {
+                            hardFaultForced = false;
+                        }
+                    },
+                    valueProviderCallback: _ => CanAccessNonBankedFaultState(isNextAccessSecure) && hardFaultForced,
+                    name: "FORCED")
                 .WithTaggedFlag("DEBUGEVT", 31);
 
+            // Cache is not simulated so the following registers are unused,
+            // but registered due to performance reasons.
+            foreach(var register in new[]
+            {
+                Registers.ICacheInvalidateAllToPoUaIgnored, Registers.ICacheInvalidateByMVAToPoUaAddress,
+                Registers.DCacheInvalidateByMVAToPoCAddress, Registers.DCacheInvalidateBySetWay,
+                Registers.DCacheCleanByMVAToPoUAddress, Registers.DCacheCleanByMVAToPoCAddress, Registers.DCacheCleanBySetWay,
+                Registers.DCacheCleanAndInvalidateByMVAToPoCAddress, Registers.DCacheCleanAndInvalidateBySetWay,
+                Registers.BranchPredictorInvalidateAllIgnored,
+            })
+            {
+                register.Define(RegisterCollection).WithIgnoredBits(0, 32);
+            }
+
             Registers.CacheSizeSelection.Define(RegisterCollection)
-                .WithTaggedFlag("InD (Instruction or Data Selection)", 0)
-                .WithTag("Level", 1, 3)
+                .WithTaggedFlag("InD (Instruction or Data Selection)", 0, silent: true)
+                .WithTag("Level", 1, 3, silent: true)
                 .WithReservedBits(4, 28);
 
             Registers.CacheSizeID.Define(RegisterCollection)
@@ -984,6 +1755,38 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 .WithTaggedFlag("RA (Read Allocation Support)", 29)
                 .WithTaggedFlag("WB (Write Back Support)", 30)
                 .WithTaggedFlag("WT (Write Through Support)", 31);
+
+            // It is IMPLEMENTATION DEFINED whether this register is accessible only to the debugger and RES0 for
+            // software, we choose to make it accessible to software as well.
+            Registers.DebugHaltingControlAndStatus.Define(RegisterCollection)
+                .WithTaggedFlag("C_DEBUGEN (Debug Enable Control)", 0)
+                .WithTaggedFlag("C_HALT (Halt Control)", 1)
+                .WithTaggedFlag("C_STEP (Step Control)", 2)
+                .WithTaggedFlag("C_MASKINTS (Mask Interrupts Control)", 3)
+                .WithReservedBits(4, 1)
+                .WithTaggedFlag("C_SNAPSTALL (Snap Stall Control)", 5)
+                .WithTaggedFlag("C_PMOV (Halt On PMU Overflow Control)", 6)
+                .WithReservedBits(7, 9)
+                .WithTaggedFlag("S_REGRDY (Register Ready)", 16)
+                .WithTaggedFlag("S_HALT (Halted)", 17)
+                .WithFlag(18, FieldMode.Read, valueProviderCallback: _ => InSleep.IsSet, name: "S_SLEEP (Sleeping)")
+                .WithFlag(19, FieldMode.Read,
+                    valueProviderCallback: _ =>
+                    {
+                        IsCurrentCPUInSecureState(out var currentCpu);
+                        // DHCSR.S_LOCKUP reads as one only to a remote debugger
+                        // through the DAP. Software reads zero in either state.
+                        return currentCpu == null && Lockup.IsSet;
+                    },
+                    name: "S_LOCKUP (Lockup)")
+                .WithTaggedFlag("S_SDE (Secure Debug Enabled)", 20)
+                .WithTaggedFlag("S_NSUIDE (Non-secure Unprivileged Debug Enabled)", 21)
+                .WithTaggedFlag("S_SUIDE (Secure Unprivileged Debug Enabled)", 22)
+                .WithTaggedFlag("S_FPD (FP Registers Debuggable)", 23)
+                .WithTaggedFlag("S_RETIRE_ST (Retire Sticky Status)", 24)
+                .WithTaggedFlag("S_RESET_ST (Reset Sticky Status)", 25)
+                .WithTaggedFlag("S_RESTART_ST (Restart Sticky Status)", 26)
+                .WithReservedBits(27, 5);
 
             Registers.DebugExceptionAndMonitorControlRegister.Define(RegisterCollection)
                 .WithTaggedFlag("VC_CORERESET (Reset Vector Catch)", 0)
@@ -1053,13 +1856,43 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 irqs[i] = IRQState.Enabled;
             }
+            // AIRCR.BFHFNMINS creates a separate Secure HardFault instance.
+            // Like every fixed-priority HardFault, it is always enabled.
+            irqs[(int)SystemException.HardFault_S] = IRQState.Enabled;
             foreach(var i in bankedInterrupts)
             {
                 irqs[i] = IRQState.Enabled;
             }
+            foreach(var i in hardFaultEnabledInterrupts)
+            {
+                interruptEnabled[i] = false;
+            }
             maskedInterruptPresent = false;
             prioritizeSecureInterrupts = false;
             pendingIRQs.Clear();
+        }
+
+        private void SetSystemHandlerPriority(SystemException exception, byte value, bool isSecure)
+        {
+            var architecturalNumber = (int)exception;
+            if(!isSecure && !IsInterruptTargetNonSecure(architecturalNumber))
+            {
+                this.WarningLog("Cannot set priority for IRQ {0}, since it targets Secure state, and the access is in Non-secure",
+                    ExceptionToString(architecturalNumber));
+                return;
+            }
+
+            var number = isSecure && bankedInterrupts.Contains(architecturalNumber)
+                ? architecturalNumber | BankedExcpSecureBit
+                : architecturalNumber;
+            var normalizedValue = (byte)(value & priorityMask);
+            if((value & ~priorityMask) != 0)
+            {
+                this.WarningLog("Trying to set the priority for interrupt {0} to 0x{1:X}, but it should be maskable with 0x{2:X}",
+                    ExceptionToString(number), value, priorityMask);
+            }
+            priorities[number] = normalizedValue;
+            this.DebugLog("Priority 0x{0:X} set for interrupt {1}.", normalizedValue, ExceptionToString(number));
         }
 
         private void HandlePriorityWrite(long offset, bool externalInterrupt, uint value, bool isSecure)
@@ -1086,6 +1919,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     this.DebugLog("Priority 0x{0:X} set for interrupt {1}.", priorities[i], i);
                     value >>= 8;
                 }
+                FindPendingInterrupt();
             }
         }
 
@@ -1159,7 +1993,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             case RegistersV7.Control:
                 if((mpuControlRegister & 0x1) != (value & 0x1))
                 {
-                    this.cpu.MPUEnabled = (value & 0x1) != 0x0;
+                    cpu.MPUEnabled = (value & 0x1) != 0x0;
+                }
+                if((mpuControlRegister & 0x4) != (value & 0x4))
+                {
+                    cpu.MPUPrivdefena = (value & 0x4) != 0x0;
                 }
                 mpuControlRegister = value;
                 break;
@@ -1465,21 +2303,184 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        private void SetPending(int i)
+        private void SetPending(int i, bool synchronous = false)
         {
             this.DebugLog("Set pending IRQ {0}.", ExceptionToString(i));
+            i = EscalateToHardFault(i, synchronous);
+            SetPendingWithoutEscalation(i);
+        }
+
+        private void SetPendingWithoutEscalation(int i)
+        {
+            if(IsSynchronousException(i) && (irqs[i] & IRQState.Active) != 0)
+            {
+                this.ErrorLog($"Ignoring request to set {ExceptionToString(i)} pending.");
+                return;
+            }
+
             var before = irqs[i];
             irqs[i] |= IRQState.Pending;
             pendingIRQs.Add(i);
 
             // when SEVONPEND is set all interrupts (even those masked)
             // generate an event when entering the pending state
-            if(before != irqs[i] && currentSevOnPending.Get(IsInterruptTargetNonSecure(i)))
+            if(before != irqs[i] && currentSevOnPending.Get(!IsInterruptTargetNonSecure(i)))
             {
                 foreach(var cpu in machine.SystemBus.GetCPUs().OfType<CortexM>())
                 {
-                    cpu.SetEventFlag(true);
+                    cpu.SetEventFlag();
                 }
+            }
+        }
+
+        /// <summary>
+        /// Returns type of the interrupt.
+        /// It can be one of the following: Secure HardFault, Non-secure HardFault or the original interruptNo if the escalation didn't happen.
+        ///
+        /// Synchronous faults are also escalated when their priority or the current masks prevent them from becoming active.
+        /// </summary>
+        private int EscalateToHardFault(int interruptNo, bool synchronous)
+        {
+            if(!ShouldEscalateToHardFault(interruptNo, synchronous))
+            {
+                return interruptNo; /* Interrupt is enabled or is always enabled (not in dictionary), don't escalate to HardFault */
+            }
+
+            this.DebugLog("Escalating IRQ {0} to HardFault.", ExceptionToString(interruptNo));
+            // Rule RDQRR: escalation records HFSR.FORCED while retaining the
+            // original fault's return-address behavior.
+            hardFaultForced = true;
+            return GetEscalatedHardFault(interruptNo);
+        }
+
+        private bool ShouldEscalateToHardFault(int interruptNo, bool synchronous)
+        {
+            // Rules RGNVS and RTKCW (Armv8-M ARM): synchronous exceptions that cannot
+            // become active immediately, and disabled configurable-priority faults, escalate to HardFault.
+            var isAlwaysEnabled = !interruptEnabled.TryGetValue((SystemException)interruptNo, out var isEnabled);
+            return (!isAlwaysEnabled && !isEnabled)
+                || (synchronous && !CanSynchronousExceptionBecomeActive(interruptNo));
+        }
+
+        private bool ShouldEscalateStackingFault(int interruptNo, int originalException)
+        {
+            var isAlwaysEnabled = !interruptEnabled.TryGetValue((SystemException)interruptNo, out var isEnabled);
+            return (!isAlwaysEnabled && !isEnabled)
+                || !CanSynchronousExceptionBecomeActiveBeforeOriginal(interruptNo, originalException);
+        }
+
+        private int GetEscalatedHardFault(int interruptNo)
+        {
+            return GetHardFaultForTargetSecurity(!IsInterruptTargetNonSecure(interruptNo));
+        }
+
+        private int GetHardFaultForTargetSecurity(bool secure)
+        {
+            /* When targeting Secure state check if HardFault is banked, if not use normal HardFault as it'll target Secure state anyway */
+            if(secure && IsBFHFNMINSEnabled)
+            {
+                return (int)SystemException.HardFault_S;
+            }
+            return (int)SystemException.HardFault;
+        }
+
+        private bool CanSynchronousExceptionBecomeActive(int interruptNo, int? ignoredActiveException = null)
+        {
+            var state = irqs[interruptNo] | IRQState.Pending;
+            if(ignoredActiveException == interruptNo)
+            {
+                state &= ~IRQState.Active;
+            }
+            if(!IsCandidate(state))
+            {
+                return false;
+            }
+
+            return GetGroupPriority(interruptNo) < GetExecutionPriority(ignoredActiveException: ignoredActiveException);
+        }
+
+        private bool IsExecutionPriorityNonNegative(int? ignoredActiveException = null)
+        {
+            return GetExecutionPriority(ignoredActiveException: ignoredActiveException) > -1;
+        }
+
+        private bool CanSynchronousExceptionBecomeActiveBeforeOriginal(int interruptNo, int originalException)
+        {
+            DebugHelper.Assert(activeIRQs.Count > 0 && activeIRQs.Peek() == originalException);
+
+            // The original exception is acknowledged early, but is not
+            // architecturally active at the PushStack() point. Exclude it
+            // from this priority query.
+            return CanSynchronousExceptionBecomeActive(interruptNo, originalException);
+        }
+
+        private bool DoesAPreemptB(int exceptionA, int exceptionB)
+        {
+            // Armv8-M ARM pseudocode operation ComparePriorities(), with
+            // groupPri=FALSE.
+            var priorityA = AdjustPriority(exceptionA);
+            var priorityB = AdjustPriority(exceptionB);
+            if(priorityA != priorityB)
+            {
+                return priorityA < priorityB;
+            }
+
+            var numberA = exceptionA & ~BankedExcpSecureBit;
+            var numberB = exceptionB & ~BankedExcpSecureBit;
+            if(numberA != numberB)
+            {
+                return numberA < numberB;
+            }
+
+            var secureA = !IsInterruptTargetNonSecure(exceptionA);
+            var secureB = !IsInterruptTargetNonSecure(exceptionB);
+            return secureA && !secureB;
+        }
+
+        private void RestoreAcknowledgedExceptionAsPending(int originalException)
+        {
+            DebugHelper.Assert(activeIRQs.Count > 0 && activeIRQs.Peek() == originalException);
+            activeIRQs.Pop();
+            irqs[originalException] &= ~IRQState.Active;
+            SetPendingWithoutEscalation(originalException);
+        }
+
+        private int? GetActiveFixedPriorityException()
+        {
+            switch(GetRawExecutionPriority())
+            {
+            case -3:
+                return (int)SystemException.HardFault_S;
+            case -2:
+                return (int)SystemException.NMI;
+            case -1:
+                return (int)SystemException.HardFault;
+            default:
+                return null;
+            }
+        }
+
+        private void DeactivateIRQ(int number)
+        {
+            DebugHelper.Assert(activeIRQs.Count > 0 && activeIRQs.Peek() == number);
+            var currentIRQ = irqs[number];
+            DebugHelper.Assert((currentIRQ & IRQState.Active) != 0);
+
+            irqs[number] &= ~IRQState.Active;
+            activeIRQs.Pop();
+            if((currentIRQ & IRQState.Running) > 0)
+            {
+                this.NoisyLog("Completed IRQ {0} active -> pending.", ExceptionToString(number));
+                irqs[number] |= IRQState.Pending;
+                pendingIRQs.Add(number);
+            }
+            else if((currentIRQ & IRQState.Pending) != 0)
+            {
+                this.NoisyLog("Completed IRQ {0} active -> pending.", number);
+            }
+            else
+            {
+                this.NoisyLog("Completed IRQ {0} active -> inactive.", ExceptionToString(number));
             }
         }
 
@@ -1547,10 +2548,16 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     targetInterruptSecurityState[pos] = (value & mask) > 0 ? InterruptTargetSecurityState.NonSecure : InterruptTargetSecurityState.Secure;
                     mask <<= 1;
                 }
+                FindPendingInterrupt();
             }
         }
 
-        private bool ShouldRaiseException(int excp)
+        private int GetExecutionPriority(bool ignorePrimask = false, int? ignoredActiveException = null)
+        {
+            return Math.Min(GetRawExecutionPriority(ignoredActiveException), GetPriorityBoost(ignorePrimask));
+        }
+
+        private int GetPriorityBoost(bool ignorePrimask)
         {
             /* The intuition to understanding this:
              * PRIMASK is used to mask all exceptions, minus Reset, NMI and HardFault
@@ -1558,99 +2565,122 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
              * _NS variants will attempt to only disable NonSecure exceptions, but this can only happen if "PRIS" is set
              * here `BFHFNMINS` will also matter, since it retargets several exceptions (e.g. NMI), and enables HardFault banking
              */
+            var boostedPriority = 0x100;
             if(!cpu.TrustZoneEnabled)
             {
-                // These have prio below -1, so they are never maskable
-                if(excp == (int)SystemException.NMI || excp == (int)SystemException.Reset)
+                var basepriValue = basepri.NonSecureVal;
+                if(basepriValue != 0)
                 {
-                    return true;
+                    boostedPriority = ApplyPriorityGrouping(basepriValue, false);
                 }
-
-                if(cpu.PRIMASK == 0 && cpu.FAULTMASK == 0)
+                if(!ignorePrimask && cpu.GetPrimask(false) != 0)
                 {
-                    return true;
+                    boostedPriority = Math.Min(boostedPriority, 0);
                 }
-                else if(cpu.PRIMASK != 0 && cpu.FAULTMASK == 0)
+                if(cpu.GetFaultmask(false) != 0)
                 {
-                    // If only PRIMASK is set, HardFault always goes through
-                    return excp == (int)SystemException.HardFault;
+                    boostedPriority = Math.Min(boostedPriority, -1);
                 }
-                // Otherwise, if FAULTMASK is set, deny everything
+                return boostedPriority;
             }
-            else
+
+            var nonSecureBasepri = basepri.NonSecureVal;
+            if(nonSecureBasepri != 0)
             {
-                // Reset is not maskable
-                if(excp == (int)SystemException.Reset)
-                {
-                    return true;
-                }
-
-                if(cpu.GetFaultmask(true) > 0 || cpu.GetFaultmask(false) > 0)
-                {
-                    // "BFHFNMINS" is 1
-                    bool isNSEnabled = GetTargetInterruptSecurityState((int)SystemException.HardFault) == InterruptTargetSecurityState.NonSecure;
-                    if(cpu.GetFaultmask(true) > 0)
-                    {
-                        if(isNSEnabled)
-                        {
-                            return false;
-                        }
-                        else
-                        {
-                            return excp == (int)SystemException.HardFault_S || excp == (int)SystemException.NMI;
-                        }
-                    }
-                    else if(cpu.GetFaultmask(false) > 0)
-                    {
-                        if(isNSEnabled)
-                        {
-                            // If Configurable exceptions target Non-secure mode, and PRIS is set, we boost current execution priority to 0x80
-                            // which is the boundary between Secure and Non-secure priorities, so only Secure exceptions will pass.
-                            // If PRIS is unset, we block everything (raise priotity to 0), but not HardFault (Secure and Non-Secure) and NMI.
-                            return (prioritizeSecureInterrupts && !IsInterruptTargetNonSecure(excp))
-                                || excp == (int)SystemException.NMI || excp == (int)SystemException.HardFault || excp == (int)SystemException.HardFault_S;
-                        }
-                        else
-                        {
-                            // Configurable exceptions target Secure mode only, so we raise execution priority to -1
-                            return excp == (int)SystemException.NMI;
-                        }
-                    }
-                }
-                // Secure PRIMASK is unset, so all pass, unless Non-secure is set
-                else if(cpu.GetPrimask(true) == 0)
-                {
-                    if(cpu.GetPrimask(false) == 0)
-                    {
-                        return true;
-                    }
-                    else
-                    {
-                        // If PRIMASK_NS is set, and PRIS is set, we boost current execution priority to 0x80
-                        // which is the boundary between Secure and Non-secure priorities, so only Secure exceptions will pass.
-                        // If PRIS is unset, we block everything (raise priotity to 0), but not HardFault and NMI.
-                        return (prioritizeSecureInterrupts && !IsInterruptTargetNonSecure(excp))
-                            || excp == (int)SystemException.NMI || excp == (int)SystemException.HardFault;
-                    }
-                }
-                // Secure PRIMASK is set - deny all, except HardFault and NMI (exec priority boosted to 0)
-                else if(cpu.GetPrimask(true) > 0)
-                {
-                    return excp == (int)SystemException.HardFault || excp == (int)SystemException.HardFault_S || excp == (int)SystemException.NMI;
-                }
+                var priority = ApplyPriorityGrouping(nonSecureBasepri, false);
+                boostedPriority = ApplyPriorityRestriction(priority, false);
             }
 
-            // Ignore exception otherwise
-            return false;
+            var secureBasepri = basepri.SecureVal;
+            if(secureBasepri != 0)
+            {
+                boostedPriority = Math.Min(boostedPriority, ApplyPriorityGrouping(secureBasepri, true));
+            }
+
+            var restrictedNonSecurePriority = prioritizeSecureInterrupts ? 0x80 : 0;
+            if(!ignorePrimask)
+            {
+                if(cpu.GetPrimask(false) != 0)
+                {
+                    boostedPriority = Math.Min(boostedPriority, restrictedNonSecurePriority);
+                }
+                if(cpu.GetPrimask(true) != 0)
+                {
+                    boostedPriority = Math.Min(boostedPriority, 0);
+                }
+            }
+            if(cpu.GetFaultmask(false) != 0)
+            {
+                boostedPriority = Math.Min(boostedPriority,
+                    IsBFHFNMINSEnabled ? -1 : restrictedNonSecurePriority);
+            }
+            if(cpu.GetFaultmask(true) != 0)
+            {
+                boostedPriority = Math.Min(boostedPriority, IsBFHFNMINSEnabled ? -3 : -1);
+            }
+            return boostedPriority;
+        }
+
+        private int GetRawExecutionPriority(int? ignoredActiveException = null)
+        {
+            var priority = 0x100;
+            var ignored = false;
+            foreach(var activeInterrupt in activeIRQs)
+            {
+                if(!ignored && ignoredActiveException.HasValue && activeInterrupt == ignoredActiveException.Value)
+                {
+                    ignored = true;
+                    continue;
+                }
+                priority = Math.Min(priority, GetGroupPriority(activeInterrupt));
+            }
+            return priority;
+        }
+
+        private int GetGroupPriority(int interruptNo)
+        {
+            return GetExceptionPriority(interruptNo, true);
         }
 
         private int AdjustPriority(int interruptNo)
         {
-            byte priority = priorities[interruptNo];
-            if(!prioritizeSecureInterrupts)
+            return GetExceptionPriority(interruptNo, false);
+        }
+
+        private int GetExceptionPriority(int interruptNo, bool groupPriority)
+        {
+            // Rule RCMTC (Armv8-M ARM) defines these fixed priorities. HardFault_S exists only when BFHFNMINS is set.
+            switch((SystemException)interruptNo)
             {
-                return priority;
+            case SystemException.Reset:
+                return -4;
+            case SystemException.HardFault_S:
+                return -3;
+            case SystemException.NMI:
+                return -2;
+            case SystemException.HardFault:
+                return -1;
             }
+
+            var secure = !IsInterruptTargetNonSecure(interruptNo);
+            var priority = (int)priorities[interruptNo];
+            if(groupPriority)
+            {
+                // ExceptionPriority(..., groupPri=TRUE) applies PRIGROUP
+                // before AIRCR.PRIS.
+                priority = ApplyPriorityGrouping(priority, secure);
+            }
+            return ApplyPriorityRestriction(priority, secure);
+        }
+
+        private int ApplyPriorityGrouping(int priority, bool secure)
+        {
+            var binaryPointMask = ~((1 << binaryPointPosition.Get(secure) + 1) - 1);
+            return priority & binaryPointMask;
+        }
+
+        private int ApplyPriorityRestriction(int priority, bool secure)
+        {
             /* Rule: RWQWK (ARMv8-M Architecture Reference Manual)
              * When AIRCR.PRIS is 1, each Non-secure SHPRn_NS.PRI_n priority field value [7:0] has the following sequence
              * applied to it, it:
@@ -1662,7 +2692,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             // It is a "byte" after all
             DebugHelper.Assert(priority <= 255);
 
-            if(IsInterruptTargetNonSecure(interruptNo))
+            if(prioritizeSecureInterrupts && !secure)
             {
                 // Divide by two, and set 7th bit. Since 255 is the lowest priority (highest number), this is fine
                 priority >>= 1;
@@ -1682,28 +2712,28 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 return (interruptNo & BankedExcpSecureBit) == 0;
             }
             // HardFault is banked if "BFHFNMINS" is set
-            if((interruptNo == (int)SystemException.HardFault_S || interruptNo == (int)SystemException.HardFault)
-                && targetInterruptSecurityState[(int)SystemException.HardFault] == InterruptTargetSecurityState.NonSecure)
+            if((interruptNo == (int)SystemException.HardFault_S || interruptNo == (int)SystemException.HardFault) && IsBFHFNMINSEnabled)
             {
                 return (interruptNo & BankedExcpSecureBit) == 0;
             }
             return targetInterruptSecurityState[interruptNo] == InterruptTargetSecurityState.NonSecure;
         }
 
-        private bool IsCandidate(IRQState state, int index)
+        private bool CanAccessNonBankedFaultState(bool isSecure)
+        {
+            // Rules IHGFM and ILRNV (Armv8-M ARM):
+            // BFHFNMINS selects the BusFault target state, and BFAR_NS reads as
+            // zero while BusFault targets Secure state. BFSR follows the same
+            // Non-secure RAZ/WI rule (BFSR register description in D1.2).
+            return !cpu.TrustZoneEnabled || isSecure || IsInterruptTargetNonSecure((int)SystemException.BusFault);
+        }
+
+        private bool IsCandidate(IRQState state)
         {
             const IRQState mask = IRQState.Pending | IRQState.Enabled | IRQState.Active;
             const IRQState candidate = IRQState.Pending | IRQState.Enabled;
 
-            return ((state & mask) == candidate) &&
-                   (basepri.Get(!IsInterruptTargetNonSecure(index)) == 0 || priorities[index] < basepri.Get(!IsInterruptTargetNonSecure(index)));
-        }
-
-        private bool DoesAPreemptB(int priorityA, int priorityB, bool secureA, bool secureB)
-        {
-            var binaryPointMaskA = ~((1 << binaryPointPosition.Get(secureA) + 1) - 1);
-            var binaryPointMaskB = ~((1 << binaryPointPosition.Get(secureB) + 1) - 1);
-            return (priorityA & binaryPointMaskA) < (priorityB & binaryPointMaskB);
+            return (state & mask) == candidate;
         }
 
         private uint GetPending(int offset, bool isSecure)
@@ -1776,15 +2806,21 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private bool canResetOnlyFromSecure;
 
         private IFlagRegisterField sleepOnExitEnabled;
+        private IFlagRegisterField hardFaultVectorTable;
         private uint cpuId;
         private CortexM cpu;
 
         private bool maskedInterruptPresent;
+        private bool hardFaultForced;
+        private bool isLockedUp;
         private MPUVersion mpuVersion;
         private bool prioritizeSecureInterrupts;
         private bool deepSleepOnlyFromSecure;
         private bool isNextAccessSecure;
         private uint mpuControlRegister;
+
+        // The interrupt is enabled, either if it's NOT present in the Dictionary, or it's present and has the value set to true.
+        private readonly Dictionary<SystemException, bool> interruptEnabled;
         private readonly ISet<int> pendingIRQs;
         private readonly Stack<int> activeIRQs;
         private readonly IMachine machine;
@@ -1793,9 +2829,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private readonly RegisterMapper mapper;
 
         private readonly ExceptionSimpleArray<IRQState> irqs;
-
-        // bit [16] DC / Cache enable. This is a global enable bit for data and unified caches.
-        private readonly SecurityBanked<uint> ccr;
 
         // This is configurable through NVIC_ITNSx only for Hardware Interrupts (exception numbered 16 and above)
         // for configuring selected exceptions, look at AIRCR.BFHFNMINS
@@ -1823,6 +2856,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private const int ClearPendingEnd      = 0x2C0;
 
         private const int BankedExcpSecureBit  = 1 << 30;
+        private const uint BusFaultStatusMask  = 0xFF00;
         private const uint InterruptProgramStatusRegisterMask = 0x1FF;
         private const int IRQCount             = 512 + 16 + 1;
         private const int ClearPendingStart    = 0x280;
@@ -1840,6 +2874,21 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private const int SysTickCalibration100Hz = 100;
         private const int SetPendingEnd        = 0x240;
         private const int SysTickMaxValue = (1 << 24) - 1;
+
+        public enum LazyFpFaultResult
+        {
+            Deferred,
+            Taken,
+            Lockup,
+        }
+
+        public enum SynchronousFaultResult
+        {
+            Pending,
+            Lockup,
+            Replaced,
+            Ignored,
+        }
 
         public enum InterruptTargetSecurityState
         {
@@ -1903,6 +2952,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 systickEnabled = false;
                 reloadValue = 0;
+                TickInterruptEnabled = false;
+                CountFlag = false;
 
                 systick.Reset();
                 systick.AutoUpdate = true;
@@ -1910,11 +2961,13 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
             public void UpdateSystickValue()
             {
-                if(reloadValue != 0)
+                if(reloadValue == 0)
                 {
-                    // Write to this register does not trigger the SysTick exception logic - we can't write zero to timer value as it would trigger an event.
-                    systick.Value = reloadValue;
+                    // Write to this register does not trigger the SysTick exception logic, so disable the timer before setting its value to 0
+                    systick.Enabled = false;
                 }
+
+                systick.Value = reloadValue;
                 CountFlag = false;
             }
 
@@ -1931,6 +2984,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 get => systickEnabled;
                 set
                 {
+                    if(systickEnabled == value)
+                    {
+                        // Nothing to do
+                        return;
+                    }
                     systickEnabled = value;
                     if(value && Reload == 0)
                     {
@@ -1952,7 +3010,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 get => reloadValue;
                 set
                 {
-                    if(Enabled && reloadValue == 0 && !systick.Enabled)
+                    if(Enabled && reloadValue == 0 && value != 0 && !systick.Enabled)
                     {
                         // We explicitly enable underlying SysTick counter only in the case it was blocked by RELOAD=0.
                         // We ignore other cases, as we don't want to accidentally enable counter in DEEPSLEEP just by writing to this register.
@@ -1979,6 +3037,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 set
                 {
                     systick.Divider = value;
+                }
+            }
+
+            public bool Clocked
+            {
+                get => systick.Clocked;
+                set
+                {
+                    systick.Clocked = value;
                 }
             }
 
@@ -2097,7 +3164,6 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             ConfigurableFaultStatus = 0xD28, // CFSR
             HardFaultStatus = 0xD2C, // HFSR
             DebugFaultStatus = 0xD30, // DFSR
-            // FPU registers 0xD88 .. F3C
             MemoryFaultAddress = 0xD34, // MMFAR
             BusFaultAddress = 0xD38, // BFAR
             AuxiliaryFaultStatus = 0xD3C, // AFSR
@@ -2119,7 +3185,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             CacheType = 0xD7C, // CTR
             CacheSizeID = 0xD80, // CCSIDR
             CacheSizeSelection = 0xD84, // CSSELR
+            // FPU registers 0xD88 .. F3C
             CoprocessorAccessControl = 0xD88, // CPACR
+            NonsecureAccessControl  = 0xD8C, // NSACR
             MPUType = 0xD90, // MPU_TYPE
             MPUControl = 0xD94, // MPU_CTRL
             MPURegionNumber = 0xD98, // MPU_RNR
@@ -2138,6 +3206,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             SAURegionLimitAddress = 0xDE0, // SAU_RLAR
             SecureFaultStatus = 0xDE4, // SAU_SFSR
             SecureFaultAddress = 0xDE8, // SAU_SFAR
+            DebugHaltingControlAndStatus = 0xDF0, // DHCSR
             DebugExceptionAndMonitorControlRegister = 0xDFC, // DEMCR
             SoftwareTriggerInterrupt = 0xF00, // STIR
             FPContextControl = 0xF34, // FPCCR
@@ -2258,6 +3327,19 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             (int)SystemException.DebugMonitor_S,
             // Lack of HardFault here is not a mistake
             // HardFault is by default handled as Secure exception
+        };
+
+        // Interrupts that can escalate to HardFault when not enabled
+        private static readonly SystemException[] hardFaultEnabledInterrupts = new SystemException []
+        {
+            SystemException.BusFault,
+            SystemException.SecureFault,
+
+            SystemException.MemManageFault,
+            SystemException.MemManageFault_S,
+
+            SystemException.UsageFault,
+            SystemException.UsageFault_S,
         };
     }
 }

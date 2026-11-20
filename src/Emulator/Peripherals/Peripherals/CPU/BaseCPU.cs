@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -78,7 +78,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public ulong Step(int count = 1)
         {
-            if(IsHalted)
+            if(isAborted)
+            {
+                this.Log(LogLevel.Warning, "Ignoring stepping on an aborted CPU");
+                return PC;
+            }
+            if(HasAnyHaltingCondition)
             {
                 this.Log(LogLevel.Warning, "Ignoring stepping on a halted CPU");
                 return PC;
@@ -177,7 +182,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public bool DebuggerConnected { get; set; }
 
-        public bool IsPaused => isPaused;
+        public bool IsPaused => isPausedRequested;
 
         public virtual ExecutionMode ExecutionMode
         {
@@ -247,50 +252,47 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public override bool IsHalted
+        public bool Clocked
         {
             get
             {
-                return isHaltedRequested;
+                return clocked;
             }
 
             set
             {
                 this.Trace();
-                if(value == isHaltedRequested)
+                if(value == clocked)
                 {
                     return;
                 }
+                clocked = value;
 
-                lock(pauseLock)
-                {
-                    this.Trace();
-                    isHaltedRequested = value;
-                    UpdateHaltedState();
-
-                    if(value)
-                    {
-                        if(started && !isPaused)
-                        {
-                            wasRunningWhenHalted = true;
-                            Pause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
-                        }
-                    }
-                    else
-                    {
-                        if(EmulationState == EmulationCPUState.InReset)
-                        {
-                            EmulationState = EmulationCPUState.Running;
-                        }
-
-                        if(wasRunningWhenHalted)
-                        {
-                            Resume();
-                        }
-                    }
-                }
+                UpdateRequestedHaltedState();
             }
         }
+
+        public override bool IsHalted
+        {
+            get
+            {
+                return isHalted;
+            }
+
+            set
+            {
+                this.Trace();
+                if(value == isHalted)
+                {
+                    return;
+                }
+                isHalted = value;
+
+                UpdateRequestedHaltedState();
+            }
+        }
+
+        public override bool HasAnyHaltingCondition => base.HasAnyHaltingCondition || !Clocked || HaltedByDebugger;
 
         public bool OnPossessedThread
         {
@@ -325,6 +327,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public Endianess Endianness { get; }
 
+        public CpuBitness Bitness => bitness;
+
         //The debug mode disables interrupt handling in the emulated CPU
         //Additionally, some instructions, suspending execution, until an interrupt arrives (e.g. HLT on x86 or WFI on ARM) are treated as NOP
         public virtual bool ShouldEnterDebugMode
@@ -337,6 +341,21 @@ namespace Antmicro.Renode.Peripherals.CPU
                     this.Log(LogLevel.Warning, "The debug mode now has no effect - connect a debugger, and switch to stepping mode.");
                 }
                 shouldEnterDebugMode = value;
+            }
+        }
+
+        public virtual bool HaltedByDebugger
+        {
+            get => haltedByDebugger;
+            set
+            {
+                this.Trace();
+                if(value == haltedByDebugger)
+                {
+                    return;
+                }
+                haltedByDebugger = value;
+                UpdateRequestedHaltedState();
             }
         }
 
@@ -367,6 +386,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             this.machine = machine;
             this.bitness = bitness;
             isPaused = true;
+            clocked = true;
 
             singleStepSynchronizer = new Synchronizer();
             EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged += UpdateHaltedState;
@@ -374,9 +394,25 @@ namespace Antmicro.Renode.Peripherals.CPU
             Clustered = new BaseCPU[] { this };
         }
 
-        protected virtual bool UpdateHaltedState(bool ignoreExecutionMode = false)
+        protected void ClearPauseWhileHalted()
         {
-            var shouldBeHalted = isHaltedRequested || (IsSingleStepMode && !IsSingleStepBlocking && !ignoreExecutionMode);
+            lock(pauseLock)
+            {
+                if(isAborted || !isPausedRequested || !isHaltedRequested)
+                {
+                    return;
+                }
+
+                // Allow time to advance without leaving the halt or invoking OnResume.
+                // Keep isPaused set so releasing the halt performs the actual resume.
+                isPausedRequested = false;
+                UpdateHaltedState(ignoreExecutionMode: false, fromPausedState: true);
+            }
+        }
+
+        protected override bool UpdateHaltedState(bool ignoreExecutionMode = false, bool fromPausedState = false)
+        {
+            var shouldBeHalted = !isPausedRequested && (isHaltedRequested || (IsSingleStepMode && !IsSingleStepBlocking && !ignoreExecutionMode));
 
             if(shouldBeHalted == currentHaltedState)
             {
@@ -425,6 +461,32 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        protected virtual void UpdateRequestedHaltedState()
+        {
+            lock(pauseLock)
+            {
+                this.Trace();
+                var value = isHalted || !clocked || haltedByDebugger;
+                if(isHaltedRequested == value)
+                {
+                    return;
+                }
+                isHaltedRequested = value;
+
+                if(isHaltedRequested)
+                {
+                    DoPause(new HaltArguments(HaltReason.Pause, this), checkPauseGuard: false);
+                }
+                else
+                {
+                    if(!isPausedRequested)
+                    {
+                        Resume();
+                    }
+                }
+            }
+        }
+
         protected virtual void InnerPause(bool onCpuThread, bool checkPauseGuard)
         {
             RequestPause();
@@ -468,6 +530,20 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected virtual void Pause(HaltArguments haltArgs, bool checkPauseGuard)
         {
+            lock(pauseLock)
+            {
+                if(isPausedRequested)
+                {
+                    return;
+                }
+                isPausedRequested = true;
+                DoPause(haltArgs, checkPauseGuard);
+            }
+        }
+
+        protected virtual void DoPause(HaltArguments haltArgs, bool checkPauseGuard)
+        {
+            UpdateHaltedState();
             if(isAborted || isPaused)
             {
                 // cpu is already paused or aborted
@@ -518,7 +594,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected override void OnResume()
         {
-            if(EmulationState == EmulationCPUState.InReset && !currentHaltedState)
+            if(EmulationState == EmulationCPUState.InReset)
             {
                 EmulationState = EmulationCPUState.Running;
             }
@@ -553,6 +629,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             started = false;
             Pause(new HaltArguments(HaltReason.Abort, this), checkPauseGuard: false);
             singleStepSynchronizer.Enabled = false;
+            // Interrupt any blocking operations on the CPU's TimeHandle to
+            // prevent deadlocks when joining the CPU thread.
+            var success = false;
+            timeHandle?.Interrupt(ref success);
             cpuThreadCopy?.Join();
             EmulationManager.Instance.CurrentEmulation.SingleStepBlockingChanged -= UpdateHaltedState;
         }
@@ -716,7 +796,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected CpuResult CpuThreadBodyInner(bool singleStep, bool skipThisRound = false)
         {
-            if(!TimeHandle.RequestTimeInterval(out var interval))
+            // If the TimeHandle of this CPU is disabled the CPU thread will spin on this function
+            // untill the handle becomes active again. To reduce the strain on the host CPU block
+            // inside RequestTimeInterval and wait for the handle to become active before proceeding further.
+            if(!TimeHandle.RequestTimeInterval(out var interval, blockWhileDisabled: true))
             {
                 this.Trace();
                 return CpuResult.NothingExecuted;
@@ -816,6 +899,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     {
                         this.Trace(result.ToString());
                         isAborted = true;
+                        machine.Abort();
                         break;
                     }
                     else if(result == ExecutionResult.Interrupted || result == ExecutionResult.StoppedAtWatchpoint)
@@ -897,6 +981,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected bool shouldEnterDebugMode;
         protected bool neverWaitForInterrupt;
         protected bool dispatcherRestartRequested;
+        protected bool clocked;
+        protected bool isHalted;
+        protected bool haltedByDebugger;
         protected bool isHaltedRequested;
         protected bool currentHaltedState;
 
@@ -1015,7 +1102,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         private EmulationCPUState state = EmulationCPUState.InReset;
         private TimeHandle timeHandle;
 
-        private bool wasRunningWhenHalted;
         private ulong executedResiduum;
         private ulong instructionsLeftThisRound;
         private ulong instructionsExecutedThisRound;
